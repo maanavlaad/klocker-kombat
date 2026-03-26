@@ -1755,6 +1755,7 @@ function doHit(atk,def,dmg,kb){
 }
 
 function endRound(w){
+  if(net.enabled) netSend('round_end', { winner: w===P1?'p1':'p2' }, net.oppName);
   if(w===P1)p1w++;else p2w++;
   // reset per-round mechanics
   window._toxicGround=false;
@@ -5877,7 +5878,29 @@ function onNetMessage(msg) {
   const { type, from, data } = msg.data || {};
   if (from === net.myName) return;
 
-  if (type === 'match_start') {
+  if (type === 'state') {
+    // P1's authoritative state — P2 applies it directly
+    if (!net.isP1 && P1 && P2 && data) {
+      // Apply P1's simulation results for both players
+      const applyState = (p, s) => {
+        if (!s) return;
+        p.x = s.x; p.y = s.y; p.vx = s.vx; p.vy = s.vy;
+        p.hp = s.hp; p.spm = s.spm;
+        p.state = s.state; p.facing = s.facing;
+        p.acd = s.acd; p.hst = s.hst;
+        p.ijp = s.ijp; p.ibl = s.ibl; p.flt = s.flt;
+      };
+      applyState(P1, data.p1);
+      applyState(P2, data.p2);
+      // Also store P1's keys in remoteKeys for display
+      net._latestRemoteKeys = data.keys || {};
+    }
+  } else if (type === 'keys') {
+    // P2's keys arriving at P1 — store for next simulation frame
+    if (net.isP1 && data && data.keys) {
+      net._latestRemoteKeys = data.keys;
+    }
+  } else if (type === 'match_start') {
     // Fallback: if presence didn't trigger us, this will
     if (!net.isP1 && net.status === 'lobby') {
       net.oppName = from;
@@ -5910,32 +5933,53 @@ function netSend(type, data) {
 }
 
 // ── INPUT SYNC TICK (called every game frame) ─────────
+// Architecture: P1 is authoritative host.
+// - Both players send their own raw key state every frame
+// - P1 receives P2's keys, runs full simulation, sends authoritative positions to P2
+// - P2 receives P1's authoritative state and applies it directly (no local sim for P2)
+// This eliminates desync entirely at the cost of ~1 frame extra latency for P2
+
 function netTick() {
   if (!net.enabled || !net.connected) return;
   net.frameNum++;
 
-  // 1. Snapshot and buffer my local keys
-  const snap = netKeysSnapshot();
-  net.localBuf.push({ frame: net.frameNum, keys: snap });
-  if (net.localBuf.length > net.INPUT_DELAY + 4) net.localBuf.shift();
-
-  // 2. Send my keys every frame (throttle to ~60fps max)
   const now = performance.now();
-  if (now - net.lastSent >= 14) {   // ~70/s cap
-    netSend('keys', { frame: net.frameNum, keys: snap });
+  const snap = netKeysSnapshot();
+
+  // Always send my keys to opponent (throttled to ~60fps)
+  if (now - net.lastSent >= 14) {
+    if (net.isP1) {
+      // P1: send full authoritative game state to P2
+      if (P1 && P2) {
+        netSend('state', {
+          f: net.frameNum,
+          p1: { x:P1.x, y:P1.y, vx:P1.vx, vy:P1.vy, hp:P1.hp, spm:P1.spm,
+                state:P1.state, facing:P1.facing, acd:P1.acd, hst:P1.hst,
+                ijp:P1.ijp, ibl:P1.ibl, flt:P1.flt },
+          p2: { x:P2.x, y:P2.y, vx:P2.vx, vy:P2.vy, hp:P2.hp, spm:P2.spm,
+                state:P2.state, facing:P2.facing, acd:P2.acd, hst:P2.hst,
+                ijp:P2.ijp, ibl:P2.ibl, flt:P2.flt },
+          keys: snap,  // P1's keys for P2's reference
+        }, net.oppName);
+      }
+    } else {
+      // P2: just send my keys to P1 so P1 can simulate P2 correctly
+      netSend('keys', { f: net.frameNum, keys: snap }, net.oppName);
+    }
     net.lastSent = now;
   }
 
-  // 3. Apply opponent's delayed input (INPUT_DELAY frames behind)
-  const targetFrame = net.frameNum - net.INPUT_DELAY;
-  const remoteFrame = net.remoteBuf.find(f => f.frame === targetFrame)
-                   || net.remoteBuf[0];   // fallback: use oldest available
-  if (remoteFrame) net.remoteKeys = remoteFrame.keys;
+  // Apply opponent's input
+  if (net.isP1) {
+    // P1 runs authoritative sim — remote keys drive P2
+    net.remoteKeys = net._latestRemoteKeys || {};
+  } else {
+    // P2 renders P1's authoritative state — no local physics for either player
+    // (applied directly in onNetMessage when 'state' arrives)
+    net.remoteKeys = snap; // P2's own keys (unused in rendering — P1 simulates us)
+  }
 
-  // 4. My local controls also get the delay
-  const localFrame = net.localBuf.find(f => f.frame === targetFrame);
-  if (localFrame) net._delayedLocalKeys = localFrame.keys;
-  else net._delayedLocalKeys = snap;  // fallback: immediate
+  net._delayedLocalKeys = snap;
 }
 
 // Returns the effective keys object for a given binding set
@@ -6226,13 +6270,7 @@ function netIsLocalP1() { return net.isP1; }
 function netIsLocalP2() { return !net.isP1; }
 
 // ── ROUND END SYNC ────────────────────────────────────
-const _origEndRound = endRound;
-function endRound(winner) {
-  if (net.enabled) {
-    netSend('round_end', { winner: winner === P1 ? 'p1' : 'p2' });
-  }
-  _origEndRound(winner);
-}
+// endRound is patched directly above to include net sync
 
 // ═══════════════════════════════════════════════════════
 // ═══════════════════════════════════════════════════════
@@ -6273,26 +6311,23 @@ function loop(now){
       if(countdown>=0){updateCountdown();}
       else if(gst==='fight'&&cdDone){
         rTick++;if(rTick>=60){rTick=0;rTimer--;if(rTimer<=0){gst='ko';endRound(P1.hp>=P2.hp?P1:P2);}}
-        // Online: tick network input system
+        // Online: tick network
         if(net.enabled) netTick();
-        // Route keys: in online mode P1 uses local/delayed keys, P2 uses remote keys
-        const _B1keys = net.enabled ? (net.isP1 ? (net._delayedLocalKeys||keys) : net.remoteKeys) : keys;
-        const _B2keys = net.enabled ? (net.isP1 ? net.remoteKeys : (net._delayedLocalKeys||keys)) : keys;
-        // Temporarily override keys for each upP call
-        const _savedKeys = Object.assign({}, keys);
-        if(net.enabled){
-          Object.keys(keys).forEach(k=>delete keys[k]);
-          Object.assign(keys, _B1keys);
-        }
-        upP(P1,P2,B1);
-        if(net.enabled){
-          Object.keys(keys).forEach(k=>delete keys[k]);
-          Object.assign(keys, _B2keys);
-        }
-        upP(P2,P1,B2);
-        if(net.enabled){
-          Object.keys(keys).forEach(k=>delete keys[k]);
-          Object.assign(keys, _savedKeys);
+
+        if(!net.enabled || net.isP1) {
+          // Local or P1 host: run full simulation
+          const _B1keys = net.enabled ? (net._delayedLocalKeys||keys) : keys;
+          const _B2keys = net.enabled ? (net._latestRemoteKeys||{}) : keys;
+          const _savedKeys = Object.assign({},keys);
+          if(net.enabled){ Object.keys(keys).forEach(k=>delete keys[k]); Object.assign(keys,_B1keys); }
+          upP(P1,P2,B1);
+          if(net.enabled){ Object.keys(keys).forEach(k=>delete keys[k]); Object.assign(keys,_B2keys); }
+          upP(P2,P1,B2);
+          if(net.enabled){ Object.keys(keys).forEach(k=>delete keys[k]); Object.assign(keys,_savedKeys); }
+        } else {
+          // P2: don't run local physics — P1 sends authoritative state
+          // Only process local P2 keys for sending (done in netTick)
+          // Still need to update HUD
         }
         updHUD();
         updateProjs(P1,P2);updateGasClouds(P1,P2);
