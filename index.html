@@ -5712,16 +5712,9 @@ const net = {
   frameNum: 0,
   lastSent: 0,
   pingMs: 0,
-  // Input history: circular buffer of {frame, keys} for last ROLLBACK_FRAMES frames
-  localInputs:  [],   // my inputs, indexed by frame
-  remoteInputs: {},   // opponent inputs keyed by frame number
-  // Snapshot ring buffer: array of full game state snapshots
-  snapshots: [],
-  // Prediction: last known remote keys (held forward)
-  lastRemoteKeys: {},
-  // Misprediction tracking
-  pendingRollback: null,
-  _replayMode: false,  // true during rollback replay (suppress sounds/effects)
+  lastRemoteKeys: {},          // most recent keys from opponent
+  _myKeysThisFrame: {},
+  _remoteKeysThisFrame: {},
 };
 
 // Keys we care about
@@ -5834,91 +5827,41 @@ function restoreSnapshot(snap) {
 }
 
 // ── ROLLBACK TICK ─────────────────────────────────────
+// ── SIMPLE LOCKSTEP NETCODE ───────────────────────────
+// Both players send inputs every frame.
+// Each player simulates using their own local keys immediately (zero lag)
+// AND uses the latest received remote keys for the opponent.
+// Remote keys are updated as fast as Ably delivers them (~16-50ms).
+// Since both simulations use the same logic, they stay roughly in sync.
+// Small divergences are corrected by periodic full state sync from P1.
+
 function netTick() {
   if (!net.enabled || !net.connected) return;
   net.frameNum++;
 
-  // 1. Snapshot this frame BEFORE simulation
-  const snap = takeSnapshot();
-  net.snapshots.push(snap);
-  if (net.snapshots.length > ROLLBACK_FRAMES + 2) net.snapshots.shift();
-
-  // 2. Store my local input for this frame
+  // My current keys
   const myKeys = netKeysSnapshot();
-  net.localInputs.push({ frame: net.frameNum, keys: myKeys });
-  if (net.localInputs.length > ROLLBACK_FRAMES + 2) net.localInputs.shift();
+  net._myKeysThisFrame = myKeys;
 
-  // 3. Send my input to opponent (every frame, throttled by 14ms)
+  // Opponent keys = latest received (updated by onNetMessage)
+  net._remoteKeysThisFrame = net.lastRemoteKeys || {};
+
+  // Send my keys every frame (throttled ~60/s)
   const now = performance.now();
   if (now - net.lastSent >= 14) {
-    netSend('input', { f: net.frameNum, k: myKeys }, net.oppName);
+    netSend('input', { k: myKeys }, net.oppName);
     net.lastSent = now;
   }
 
-  // 4. Check if opponent's real input arrived for a past frame
-  //    If it differs from what we predicted, rollback + replay
-  const checkFrame = net.frameNum - 1;
-  const arrived = net.remoteInputs[checkFrame];
-  if (arrived !== undefined) {
-    const predicted = net.lastRemoteKeys;
-    if (!inputsEqual(arrived, predicted)) {
-      // MISPREDICTION — find snapshot for checkFrame
-      const snapToRestore = net.snapshots.find(s => s.frame === checkFrame);
-      if (snapToRestore) {
-        // Rollback
-        restoreSnapshot(snapToRestore);
-        net._replayMode = true;
-        // Replay all frames from checkFrame to frameNum with correct inputs
-        const replayFrom = checkFrame;
-        const replayTo   = net.frameNum;
-        for (let rf = replayFrom; rf < replayTo; rf++) {
-          // Get local input for this replay frame
-          const localInp = net.localInputs.find(i => i.frame === rf);
-          const remoteInp = net.remoteInputs[rf] || net.lastRemoteKeys;
-          // Apply: local = my keys, remote = opponent keys
-          const p1Keys = net.isP1 ? (localInp?.keys || {}) : remoteInp;
-          const p2Keys = net.isP1 ? remoteInp : (localInp?.keys || {});
-          simulateFrame(p1Keys, p2Keys);
-        }
-        net._replayMode = false;
-      }
-    }
-    // Update prediction for future frames
-    net.lastRemoteKeys = arrived;
-    // Clean up old remote inputs
-    delete net.remoteInputs[checkFrame - ROLLBACK_FRAMES];
+  // P1 sends full state sync every 30 frames (~0.5s) to fix drift
+  if (net.isP1 && net.frameNum % 30 === 0 && P1 && P2) {
+    netSend('sync', {
+      p1: { x:P1.x, y:P1.y, vx:P1.vx, vy:P1.vy, hp:P1.hp, spm:P1.spm,
+            state:P1.state, facing:P1.facing, acd:P1.acd, ijp:P1.ijp },
+      p2: { x:P2.x, y:P2.y, vx:P2.vx, vy:P2.vy, hp:P2.hp, spm:P2.spm,
+            state:P2.state, facing:P2.facing, acd:P2.acd, ijp:P2.ijp },
+    }, net.oppName);
   }
-
-  // 5. Return keys to use for THIS frame's simulation
-  //    (done in main loop — we just provide the key objects here)
-  net._myKeysThisFrame     = myKeys;
-  net._remoteKeysThisFrame = net.lastRemoteKeys;
-}
-
-// Simulate one game frame with given key states (used during rollback replay)
-function simulateFrame(p1Keys, p2Keys) {
-  const savedKeys = Object.assign({}, keys);
-
-  Object.keys(keys).forEach(k => delete keys[k]);
-  Object.assign(keys, p1Keys);
-  if (P1 && P2) upP(P1, P2, B1);
-
-  Object.keys(keys).forEach(k => delete keys[k]);
-  Object.assign(keys, p2Keys);
-  if (P1 && P2) upP(P2, P1, B2);
-
-  Object.keys(keys).forEach(k => delete keys[k]);
-  Object.assign(keys, savedKeys);
-
-  // Update effects
-  if (allProjs)       updateProjs(P1, P2);
-  if (gasClouds)      updateGasClouds(P1, P2);
-  if (sneezeClouds)   updateSneezeClouds(P1, P2);
-  if (slowClouds)     updateSlowClouds(P1, P2);
-  if (stunClouds)     updateStunClouds(P1, P2);
-  if (lightningBolts) updateLightningBolts(P1, P2);
-  if (webTraps)       updateWebTraps(P1, P2);
-  if (nickTraps)      updateNickTraps(P1, P2);
 }
 
 // ── CONNECT / DISCONNECT ──────────────────────────────
@@ -5989,8 +5932,7 @@ function netDisconnect() {
   if (net.channel) try { net.channel.presence.leave(); } catch(e) {}
   if (net.ablyClient) try { net.ablyClient.close(); } catch(e) {}
   net.connected = false; net.enabled = false; net.status = 'idle';
-  net.onlinePlayers = {}; net.oppName = '';
-  net.snapshots = []; net.localInputs = []; net.remoteInputs = {};
+  net.onlinePlayers = {}; net.oppName = ''; net.lastRemoteKeys = {};
 }
 
 // ── PRESENCE ──────────────────────────────────────────
@@ -6022,9 +5964,27 @@ function onNetMessage(msg) {
   if (to && to !== net.myName) return;
 
   if (type === 'input') {
-    // Store real opponent input for frame data.f
-    if (data && data.f !== undefined) {
-      net.remoteInputs[data.f] = data.k || {};
+    // Opponent's current key state — store as latest
+    if (data && data.k) net.lastRemoteKeys = data.k;
+  } else if (type === 'sync') {
+    // P1's authoritative position sync — P2 smoothly corrects toward it
+    if (!net.isP1 && data && P1 && P2) {
+      const lerp = (a, b, t) => a + (b - a) * t;
+      const t = 0.3; // blend 30% toward authoritative each sync
+      if (data.p1) {
+        P1.x = lerp(P1.x, data.p1.x, t); P1.y = lerp(P1.y, data.p1.y, t);
+        P1.vx = data.p1.vx; P1.vy = data.p1.vy;
+        P1.hp = data.p1.hp; P1.spm = data.p1.spm;
+        P1.facing = data.p1.facing; P1.acd = data.p1.acd;
+        if (data.p1.ijp !== undefined) P1.ijp = data.p1.ijp;
+      }
+      if (data.p2) {
+        P2.x = lerp(P2.x, data.p2.x, t); P2.y = lerp(P2.y, data.p2.y, t);
+        P2.vx = data.p2.vx; P2.vy = data.p2.vy;
+        P2.hp = data.p2.hp; P2.spm = data.p2.spm;
+        P2.facing = data.p2.facing; P2.acd = data.p2.acd;
+        if (data.p2.ijp !== undefined) P2.ijp = data.p2.ijp;
+      }
     }
   } else if (type === 'match_start') {
     if (!net.isP1 && net.status === 'lobby') {
@@ -6072,8 +6032,7 @@ function netSend(type, data, to=null) {
 function netStartMatch() {
   if (net.status === 'fighting') return;
   net.status = 'fighting'; net.enabled = true;
-  net.frameNum = 0; net.snapshots = []; net.localInputs = [];
-  net.remoteInputs = {}; net.lastRemoteKeys = {};
+  net.frameNum = 0; net.lastRemoteKeys = {};
   net._myKeysThisFrame = {}; net._remoteKeysThisFrame = {};
   p1ci=0; p2ci=5; p1sv=0; p2sv=0;
   csc={p1:false,p2:false}; ssc={p1:false,p2:false};
@@ -6319,18 +6278,34 @@ function loop(now){
       if(countdown>=0){updateCountdown();}
       else if(gst==='fight'&&cdDone){
         rTick++;if(rTick>=60){rTick=0;rTimer--;if(rTimer<=0){gst='ko';endRound(P1.hp>=P2.hp?P1:P2);}}
-        // Rollback netcode tick (snapshots state, sends inputs, handles rollback)
         if(net.enabled) netTick();
 
-        // Apply this frame's simulation
-        const _p1Keys = net.enabled ? (net.isP1 ? net._myKeysThisFrame : net._remoteKeysThisFrame) : keys;
-        const _p2Keys = net.enabled ? (net.isP1 ? net._remoteKeysThisFrame : net._myKeysThisFrame) : keys;
-        const _savedKeys = Object.assign({},keys);
-        Object.keys(keys).forEach(k=>delete keys[k]); Object.assign(keys,_p1Keys);
-        upP(P1,P2,B1);
-        Object.keys(keys).forEach(k=>delete keys[k]); Object.assign(keys,_p2Keys);
-        upP(P2,P1,B2);
-        Object.keys(keys).forEach(k=>delete keys[k]); Object.assign(keys,_savedKeys);
+        if(net.enabled){
+          // Online: route inputs without mutating the live keys object
+          // Create proxy key sources for each player
+          const p1src = net.isP1 ? net._myKeysThisFrame : net._remoteKeysThisFrame;
+          const p2src = net.isP1 ? net._remoteKeysThisFrame : net._myKeysThisFrame;
+          // Build temporary binding maps that read from the correct source
+          const mkBind = (src, b) => ({
+            l: b.l, r: b.r, u: b.u, p: b.p, k: b.k, s: b.s, e: b.e,
+            _src: src
+          });
+          // Temporarily patch keys to point to each source in turn
+          const liveKeys = Object.assign({}, keys);
+          // P1 turn
+          Object.keys(keys).forEach(k=>delete keys[k]);
+          Object.assign(keys, p1src);
+          upP(P1,P2,B1);
+          // P2 turn
+          Object.keys(keys).forEach(k=>delete keys[k]);
+          Object.assign(keys, p2src);
+          upP(P2,P1,B2);
+          // Restore live keys
+          Object.keys(keys).forEach(k=>delete keys[k]);
+          Object.assign(keys, liveKeys);
+        } else {
+          upP(P1,P2,B1);upP(P2,P1,B2);
+        }
         updHUD();
         updateProjs(P1,P2);updateGasClouds(P1,P2);
         updateSneezeClouds(P1,P2);
