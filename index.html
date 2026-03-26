@@ -93,6 +93,7 @@ window.addEventListener('keyup',e=>{keys[e.key]=false;});
 // ===== AUDIO =====
 const AC=new(window.AudioContext||window.webkitAudioContext)();
 const beep=(f,d,t='square',v=0.15)=>{
+  if(net&&net._replayMode)return; // suppress during rollback replay
   try{const o=AC.createOscillator(),g=AC.createGain();o.connect(g);g.connect(AC.destination);
   o.type=t;o.frequency.value=f;g.gain.setValueAtTime(v,AC.currentTime);
   g.gain.exponentialRampToValueAtTime(.001,AC.currentTime+d);o.start();o.stop(AC.currentTime+d);}catch(e){}
@@ -145,7 +146,7 @@ const CHARS=[
    lore:'Short wrestler. Cheese goblin. Genuinely dangerous.',
    moves:['F — Grapple Grab','Fwd+F — Rolling Attack','E — SPLADLE (30s CD if miss)','Down+E — FART BOOST','Up+G — Kick + Gas','G — Block/Parry','Down+G — Eat Cheese','H (SP full) — SOMERSAULT FART']},
   {id:'maxwell',name:'MAXWELL',color:'#ffdd44',sp:'MILITIA',
-   lore:'Lazy genius. R6 Siege main. Tactical operator.',
+   lore:'R6 Siege main. Tactical operator.',
    moves:['F — Gunshot (6 ammo)','E (hold) — Gadget Wheel','E (tap) — Throw Gadget','Down+E — DRONE SCOUT','Up+G — Kick','G — Block/Parry','Fwd+G — AFK (regen)','H (SP full) — MILITIA (shoots with you!)']},
   {id:'maanav',name:'MAANAV',  color:'#ff88cc',sp:'ATTACK TITAN',
    lore:'Always sick. Lies a lot. Spider-Man meets AOT.',
@@ -4452,9 +4453,9 @@ function updGen(p,op,b){
 }
 
 // ===== PARTICLES & FLOAT TEXT =====
-function spP(x,y,c,n,sp){for(let i=0;i<n;i++){const a=Math.random()*Math.PI*2,s=sp*(.5+Math.random());parts.push({x,y,vx:Math.cos(a)*s,vy:Math.sin(a)*s-1.5,c,life:28+Math.random()*18,sz:2+Math.random()*3});}}
-function ftxt(x,y,t,c){fts.push({x,y,t,c,life:55,vy:-1.1});}
-function setAnn(t,c){ann={t,c,n:90};}
+function spP(x,y,c,n,sp){if(net&&net._replayMode)return;for(let i=0;i<n;i++){const a=Math.random()*Math.PI*2,s=sp*(.5+Math.random());parts.push({x,y,vx:Math.cos(a)*s,vy:Math.sin(a)*s-1.5,c,life:28+Math.random()*18,sz:2+Math.random()*3});}}
+function ftxt(x,y,t,c){if(net&&net._replayMode)return;fts.push({x,y,t,c,life:55,vy:-1.1});}
+function setAnn(t,c){if(net&&net._replayMode)return;ann={t,c,n:90};}
 function drawParts(){
   parts=parts.filter(p=>p.life>0);
   parts.forEach(p=>{p.x+=p.vx*(slowmo?.3:1);p.y+=p.vy*(slowmo?.3:1);p.vy+=.22;p.life--;ctx.globalAlpha=p.life/30;ctx.fillStyle=p.c;ctx.fillRect(p.x-p.sz/2,p.y-p.sz/2,p.sz,p.sz);ctx.globalAlpha=1;});
@@ -5686,99 +5687,274 @@ C.addEventListener('contextmenu',e=>{
 document.addEventListener('click',()=>{AC.resume();},{ once:true });
 
 // ═══════════════════════════════════════════════════════
-// ONLINE MULTIPLAYER — Ably Input Sync (2-frame delay)
 // ═══════════════════════════════════════════════════════
-//
-// SETUP:
-// 1. Go to ably.com → your dashboard → New App → "Klocker Kombat"
-// 2. API Keys → copy Root key
-// 3. Paste it below replacing UjQMtw.3rv2nQ:8B2Xnf4hge9nItJa15TADj6UlDpS4AR_gv0td3_7oJw
-//
-// HOW IT WORKS:
-// Both players run the full game simulation locally.
-// Every frame, you send your key state to Ably.
-// Opponent's key state arrives and fills remoteKeys{}.
-// Each player's local inputs are delayed 2 frames (33ms)
-// so both sides stay in lockstep even with network jitter.
+// ONLINE MULTIPLAYER — ROLLBACK NETCODE
+// ═══════════════════════════════════════════════════════
+// Architecture:
+//   - Both players simulate locally with ZERO input lag
+//   - Each frame: snapshot state, apply local keys, predict opponent keys
+//   - When real opponent inputs arrive: if they differ from prediction,
+//     rollback to that frame's snapshot and replay forward
+//   - Result: both players feel instant, positions stay in sync
 // ═══════════════════════════════════════════════════════
 
 const KK_ABLY_KEY = 'UjQMtw.3rv2nQ:8B2Xnf4hge9nItJa15TADj6UlDpS4AR_gv0td3_7oJw';
 const KK_CHANNEL  = 'klocker-kombat-v1';
+const ROLLBACK_FRAMES = 8; // max frames to roll back (~133ms window)
 
-// ── STATE ─────────────────────────────────────────────
+// ── NET STATE ─────────────────────────────────────────
 const net = {
-  enabled:    false,       // true when in online match
-  connected:  false,
-  isP1:       true,        // am I P1 or P2 in this session
-  myName:     '',
-  oppName:    '',
-  roomCode:   '',
-  status:     'idle',      // idle|connecting|lobby|countdown|fighting
-  ablyClient: null,
-  channel:    null,
+  enabled: false, connected: false,
+  isP1: true, myName: '', oppName: '', roomCode: '',
+  status: 'idle',
+  ablyClient: null, channel: null,
   onlinePlayers: {},
-  // 2-frame input delay buffers
-  INPUT_DELAY: 2,
-  localBuf:   [],          // ring buffer of my past key states
-  remoteBuf:  [],          // ring buffer of opponent's key states
-  remoteKeys: {},          // current frame's opponent keys (after delay)
-  frameNum:   0,
-  lastSent:   0,
-  pingMs:     0,
+  frameNum: 0,
+  lastSent: 0,
+  pingMs: 0,
+  // Input history: circular buffer of {frame, keys} for last ROLLBACK_FRAMES frames
+  localInputs:  [],   // my inputs, indexed by frame
+  remoteInputs: {},   // opponent inputs keyed by frame number
+  // Snapshot ring buffer: array of full game state snapshots
+  snapshots: [],
+  // Prediction: last known remote keys (held forward)
+  lastRemoteKeys: {},
+  // Misprediction tracking
+  pendingRollback: null,
+  _replayMode: false,  // true during rollback replay (suppress sounds/effects)
 };
 
-// Keys sent over network (only what the game reads via B1/B2)
+// Keys we care about
 const NET_KEYS = ['a','d','w','s','f','g','h','e',
                   'ArrowLeft','ArrowRight','ArrowUp','ArrowDown',
                   ',','.','/','\0','0'];
 
 function netKeysSnapshot() {
   const snap = {};
-  NET_KEYS.forEach(k => { if(keys[k]) snap[k] = true; });
+  NET_KEYS.forEach(k => { if (keys[k]) snap[k] = true; });
   return snap;
 }
 
-// ── CONNECT ───────────────────────────────────────────
-function netConnect(name, roomCode, asP1) {
-  if (!KK_ABLY_KEY || KK_ABLY_KEY.length < 20 || !KK_ABLY_KEY.includes(':')) {
-    netSetStatus('❌ Add your Ably key first!'); return;
+function inputsEqual(a, b) {
+  const ak = Object.keys(a).filter(k=>a[k]).sort().join(',');
+  const bk = Object.keys(b).filter(k=>b[k]).sort().join(',');
+  return ak === bk;
+}
+
+// ── GAME STATE SNAPSHOT ───────────────────────────────
+function snapshotPlayer(p) {
+  if (!p) return null;
+  // Deep copy all serializable fields
+  return JSON.parse(JSON.stringify({
+    x:p.x,y:p.y,vx:p.vx,vy:p.vy,facing:p.facing,
+    hp:p.hp,maxHp:p.maxHp,state:p.state,ci:p.ci,
+    acd:p.acd,atkDur:p.atkDur,hst:p.hst,bst:p.bst,
+    ijp:p.ijp,ibl:p.ibl,flt:p.flt,inv:p.inv,
+    combo:p.combo,comboTimer:p.comboTimer,comboCount:p.comboCount,
+    rage:p.rage,rageOn:p.rageOn,rageT:p.rageT,
+    stam:p.stam,titan:p.titan,titanT:p.titanT,wcd:p.wcd,icd:p.icd,
+    spm:p.spm,frame:p.frame,
+    hadoukenCharging:p.hadoukenCharging,hadoukenCharge:p.hadoukenCharge,
+    hadoukenCooldown:p.hadoukenCooldown,
+    ssCharging:p.ssCharging,ssMeter:p.ssMeter,ssActive:p.ssActive,
+    ssTimer:p.ssTimer,ssDoubleJump:p.ssDoubleJump,
+    gadgetWheelOpen:p.gadgetWheelOpen,gadgetSelected:p.gadgetSelected,
+    gadgetEquipped:p.gadgetEquipped,gadgetCd:p.gadgetCd,
+    flashTimer:p.flashTimer,
+    ammo:p.ammo,reloading:p.reloading,reloadTimer:p.reloadTimer,
+    piercingRounds:p.piercingRounds,
+    cheeseCount:p.cheeseCount,cheeseTimer:p.cheeseTimer,
+    eatingCheese:p.eatingCheese,eatTimer:p.eatTimer,
+    dashCd:p.dashCd,lastDirKey:p.lastDirKey,lastDirTime:p.lastDirTime,
+    techTier:p.techTier,techMeter:p.techMeter,techDecay:p.techDecay,
+    dodgeBuffed:p.dodgeBuffed,dodgeBuffTimer:p.dodgeBuffTimer,
+    nickDashCd:p.nickDashCd,nickDashing:p.nickDashing,nickDashTimer:p.nickDashTimer,
+    trapCd:p.trapCd,afterimageCd:p.afterimageCd,
+    parrying:p.parrying,parryTimer:p.parryTimer,parrySuccess:p.parrySuccess,
+    wallSplatTimer:p.wallSplatTimer,airTechTimer:p.airTechTimer,airTeched:p.airTeched,
+    comebackActive:p.comebackActive,
+    buffDmg:p.buffDmg,buffSpd:p.buffSpd,buffDef:p.buffDef,
+    lifesteal:p.lifesteal,armor:p.armor,regen:p.regen,
+    lastStandActive:p.lastStandActive,vampireHits:p.vampireHits,
+    reflectActive:p.reflectActive,
+    cards:[...p.cards],
+    // Character-specific extras
+    mechActive:p.mechActive,mechTimer:p.mechTimer,mechCd:p.mechCd,
+    mechRocketCd:p.mechRocketCd,mechJetJumping:p.mechJetJumping,
+    zestyCharge:p.zestyCharge,zestyCharging:p.zestyCharging,zestyCd:p.zestyCd,
+    tankingIt:p.tankingIt,tankTimer:p.tankTimer,
+    spladling:p.spladling,spladleTimer:p.spladleTimer,
+    rollDashCount:p.rollDashCount,fartBoostCd:p.fartBoostCd,
+    gasCloudCount:p.gasCloudCount,
+    droneActive:p.droneActive,afkMode:p.afkMode,
+    tiredness:p.tiredness,sneezeCharge:p.sneezeCharge,smiteCd:p.smiteCd,
+  }));
+}
+
+function restorePlayer(p, snap) {
+  if (!p || !snap) return;
+  Object.assign(p, snap);
+  p.cards = [...snap.cards];
+}
+
+function takeSnapshot() {
+  return {
+    frame: net.frameNum,
+    p1: snapshotPlayer(P1),
+    p2: snapshotPlayer(P2),
+    projs: JSON.parse(JSON.stringify(allProjs || [])),
+    gasClouds: JSON.parse(JSON.stringify(gasClouds || [])),
+    slowClouds: JSON.parse(JSON.stringify(slowClouds || [])),
+    stunClouds: JSON.parse(JSON.stringify(stunClouds || [])),
+    lightningBolts: JSON.parse(JSON.stringify(lightningBolts || [])),
+    webTraps: JSON.parse(JSON.stringify(webTraps || [])),
+    nickTraps: JSON.parse(JSON.stringify(nickTraps || [])),
+    sneezeClouds: JSON.parse(JSON.stringify(sneezeClouds || [])),
+    gst, rTimer, rTick, slowmo, smT, movPlatT,
+  };
+}
+
+function restoreSnapshot(snap) {
+  restorePlayer(P1, snap.p1);
+  restorePlayer(P2, snap.p2);
+  allProjs       = JSON.parse(JSON.stringify(snap.projs));
+  gasClouds      = JSON.parse(JSON.stringify(snap.gasClouds));
+  slowClouds     = JSON.parse(JSON.stringify(snap.slowClouds));
+  stunClouds     = JSON.parse(JSON.stringify(snap.stunClouds));
+  lightningBolts = JSON.parse(JSON.stringify(snap.lightningBolts));
+  webTraps       = JSON.parse(JSON.stringify(snap.webTraps));
+  nickTraps      = JSON.parse(JSON.stringify(snap.nickTraps));
+  sneezeClouds   = JSON.parse(JSON.stringify(snap.sneezeClouds));
+  gst      = snap.gst;
+  rTimer   = snap.rTimer;
+  rTick    = snap.rTick;
+  slowmo   = snap.slowmo;
+  smT      = snap.smT;
+  movPlatT = snap.movPlatT;
+}
+
+// ── ROLLBACK TICK ─────────────────────────────────────
+function netTick() {
+  if (!net.enabled || !net.connected) return;
+  net.frameNum++;
+
+  // 1. Snapshot this frame BEFORE simulation
+  const snap = takeSnapshot();
+  net.snapshots.push(snap);
+  if (net.snapshots.length > ROLLBACK_FRAMES + 2) net.snapshots.shift();
+
+  // 2. Store my local input for this frame
+  const myKeys = netKeysSnapshot();
+  net.localInputs.push({ frame: net.frameNum, keys: myKeys });
+  if (net.localInputs.length > ROLLBACK_FRAMES + 2) net.localInputs.shift();
+
+  // 3. Send my input to opponent (every frame, throttled by 14ms)
+  const now = performance.now();
+  if (now - net.lastSent >= 14) {
+    netSend('input', { f: net.frameNum, k: myKeys }, net.oppName);
+    net.lastSent = now;
   }
-  // Sanitize name for use as Ably clientId (alphanumeric + _ -)
+
+  // 4. Check if opponent's real input arrived for a past frame
+  //    If it differs from what we predicted, rollback + replay
+  const checkFrame = net.frameNum - 1;
+  const arrived = net.remoteInputs[checkFrame];
+  if (arrived !== undefined) {
+    const predicted = net.lastRemoteKeys;
+    if (!inputsEqual(arrived, predicted)) {
+      // MISPREDICTION — find snapshot for checkFrame
+      const snapToRestore = net.snapshots.find(s => s.frame === checkFrame);
+      if (snapToRestore) {
+        // Rollback
+        restoreSnapshot(snapToRestore);
+        net._replayMode = true;
+        // Replay all frames from checkFrame to frameNum with correct inputs
+        const replayFrom = checkFrame;
+        const replayTo   = net.frameNum;
+        for (let rf = replayFrom; rf < replayTo; rf++) {
+          // Get local input for this replay frame
+          const localInp = net.localInputs.find(i => i.frame === rf);
+          const remoteInp = net.remoteInputs[rf] || net.lastRemoteKeys;
+          // Apply: local = my keys, remote = opponent keys
+          const p1Keys = net.isP1 ? (localInp?.keys || {}) : remoteInp;
+          const p2Keys = net.isP1 ? remoteInp : (localInp?.keys || {});
+          simulateFrame(p1Keys, p2Keys);
+        }
+        net._replayMode = false;
+      }
+    }
+    // Update prediction for future frames
+    net.lastRemoteKeys = arrived;
+    // Clean up old remote inputs
+    delete net.remoteInputs[checkFrame - ROLLBACK_FRAMES];
+  }
+
+  // 5. Return keys to use for THIS frame's simulation
+  //    (done in main loop — we just provide the key objects here)
+  net._myKeysThisFrame     = myKeys;
+  net._remoteKeysThisFrame = net.lastRemoteKeys;
+}
+
+// Simulate one game frame with given key states (used during rollback replay)
+function simulateFrame(p1Keys, p2Keys) {
+  const savedKeys = Object.assign({}, keys);
+
+  Object.keys(keys).forEach(k => delete keys[k]);
+  Object.assign(keys, p1Keys);
+  if (P1 && P2) upP(P1, P2, B1);
+
+  Object.keys(keys).forEach(k => delete keys[k]);
+  Object.assign(keys, p2Keys);
+  if (P1 && P2) upP(P2, P1, B2);
+
+  Object.keys(keys).forEach(k => delete keys[k]);
+  Object.assign(keys, savedKeys);
+
+  // Update effects
+  if (allProjs)       updateProjs(P1, P2);
+  if (gasClouds)      updateGasClouds(P1, P2);
+  if (sneezeClouds)   updateSneezeClouds(P1, P2);
+  if (slowClouds)     updateSlowClouds(P1, P2);
+  if (stunClouds)     updateStunClouds(P1, P2);
+  if (lightningBolts) updateLightningBolts(P1, P2);
+  if (webTraps)       updateWebTraps(P1, P2);
+  if (nickTraps)      updateNickTraps(P1, P2);
+}
+
+// ── CONNECT / DISCONNECT ──────────────────────────────
+function netConnect(name, roomCode, asP1) {
+  if (!KK_ABLY_KEY || !KK_ABLY_KEY.includes(':')) {
+    netSetStatus('❌ No Ably key configured.'); return;
+  }
   net.myName   = name.replace(/[^a-zA-Z0-9_-]/g,'_').slice(0,12);
   net.roomCode = roomCode.replace(/[^a-zA-Z0-9]/g,'').toUpperCase().slice(0,8);
   net.isP1     = asP1;
   net.status   = 'connecting';
   netSetStatus('⏳ Loading Ably SDK...');
 
-  // Check if already loaded
   if (typeof Ably !== 'undefined') { netInit(); return; }
 
-  const script = document.createElement('script');
-  script.src = 'https://cdn.ably.com/lib/ably.min-1.js';
-  script.onload = () => { netSetStatus('⏳ Connecting...'); netInit(); };
-  script.onerror = () => {
-    // Try alternate CDN
-    const s2 = document.createElement('script');
-    s2.src = 'https://cdn.jsdelivr.net/npm/ably@1/ably.min.js';
-    s2.onload = () => { netSetStatus('⏳ Connecting...'); netInit(); };
-    s2.onerror = () => netSetStatus('❌ Failed to load Ably SDK. Check internet connection.');
-    document.head.appendChild(s2);
+  const tryLoad = (url, next) => {
+    const s = document.createElement('script');
+    s.src = url;
+    s.onload = () => { netSetStatus('⏳ Connecting...'); netInit(); };
+    s.onerror = next || (() => netSetStatus('❌ Failed to load Ably SDK.'));
+    document.head.appendChild(s);
   };
-  document.head.appendChild(script);
+
+  tryLoad('https://cdn.ably.com/lib/ably.min-1.js', () =>
+    tryLoad('https://unpkg.com/ably@1.2/build/ably.min.js', () =>
+      tryLoad('https://cdn.jsdelivr.net/npm/ably@1.2.45/build/ably.min.js', null)
+    )
+  );
 }
 
 function netInit() {
   try {
-    // clientId must be alphanumeric only — strip everything else
-    const safeId = net.myName.replace(/[^a-zA-Z0-9_-]/g,'_').slice(0,20) + '_' + Math.floor(Math.random()*9000+1000);
-    net.myName = safeId;
+    const clientId = net.myName + '_' + Math.floor(Math.random()*9000+1000);
+    net.myName = clientId;
 
-    net.ablyClient = new Ably.Realtime({
-      key: KK_ABLY_KEY,
-      clientId: safeId,
-      closeOnUnload: true,
-    });
-
+    net.ablyClient = new Ably.Realtime({ key: KK_ABLY_KEY, clientId });
     net.ablyClient.connection.on('connected', () => {
       net.connected = true;
       net.channel = net.ablyClient.channels.get(`${KK_CHANNEL}-${net.roomCode}`);
@@ -5786,33 +5962,26 @@ function netInit() {
       net.channel.presence.enter({ name: net.myName, isP1: net.isP1 });
       net.channel.presence.subscribe(onPresence);
       net.channel.presence.get((err, members) => {
-        if (!err) members.forEach(m => { if (m.clientId !== net.myName) {
-          net.onlinePlayers[m.clientId] = m.data;
-          net.oppName = m.clientId;
-        }});
+        if (!err) members.forEach(m => {
+          if (m.clientId !== net.myName) {
+            net.onlinePlayers[m.clientId] = m.data;
+            net.oppName = m.clientId;
+          }
+        });
         updateOnlineLobby();
       });
       net.status = 'lobby';
       netSetStatus(`✅ In room ${net.roomCode} — waiting for opponent...`);
-      setInterval(()=>{ if(net.connected) netSend('ping',{t:Date.now()}); }, 3000);
+      setInterval(() => { if (net.connected) netSend('ping', { t: Date.now() }, net.oppName); }, 3000);
     });
-
-    net.ablyClient.connection.on('failed', (stateChange) => {
-      const reason = stateChange?.reason?.message || 'unknown error';
-      netSetStatus('❌ Connection failed: ' + reason);
-      console.error('[NET] Connection failed:', stateChange);
+    net.ablyClient.connection.on('failed', sc => {
+      netSetStatus('❌ Failed: ' + (sc?.reason?.message || 'unknown'));
     });
-
-    net.ablyClient.connection.on('suspended', () => netSetStatus('⚠️ Connection suspended — retrying...'));
-    net.ablyClient.connection.on('disconnected', (stateChange) => {
-      net.connected = false;
-      const reason = stateChange?.reason?.message || '';
-      netSetStatus('🔴 Disconnected' + (reason ? ': ' + reason : ''));
+    net.ablyClient.connection.on('disconnected', () => {
+      net.connected = false; netSetStatus('🔴 Disconnected');
     });
-
   } catch(e) {
-    netSetStatus('❌ Error: ' + e.message);
-    console.error('[NET] Init error:', e);
+    netSetStatus('❌ ' + e.message);
   }
 }
 
@@ -5821,459 +5990,298 @@ function netDisconnect() {
   if (net.ablyClient) try { net.ablyClient.close(); } catch(e) {}
   net.connected = false; net.enabled = false; net.status = 'idle';
   net.onlinePlayers = {}; net.oppName = '';
+  net.snapshots = []; net.localInputs = []; net.remoteInputs = {};
 }
 
 // ── PRESENCE ──────────────────────────────────────────
 function onPresence(msg) {
   if (msg.clientId === net.myName) return;
-
   if (msg.action === 'enter' || msg.action === 'update') {
     net.onlinePlayers[msg.clientId] = msg.data;
     net.oppName = msg.clientId;
-
     if (net.status === 'lobby') {
-      // Someone joined our room — start match on our end
       netSetStatus(`⚔️ ${net.oppName} connected!`);
       setTimeout(() => {
         netStartMatch();
-        // Immediately broadcast our state so opponent sees us on CS
         setTimeout(() => netBroadcastSelectState(), 200);
       }, 500);
     } else if (net.status === 'fighting') {
-      // Already in match — apply their select state
       applyRemoteSelectState(msg.data);
     }
-
   } else if (msg.action === 'leave') {
     delete net.onlinePlayers[msg.clientId];
-    if (msg.clientId === net.oppName) {
-      net.oppName = '';
-      netSetStatus('⚠️ Opponent disconnected!');
-    }
+    if (msg.clientId === net.oppName) { net.oppName = ''; netSetStatus('⚠️ Opponent disconnected!'); }
   }
   updateOnlineLobby();
 }
 
-function netStartMatch() {
-  if (net.status === 'fighting') return;
-  net.status   = 'fighting';
-  net.enabled  = true;
-  net.frameNum = 0;
-  net.localBuf = [];
-  net.remoteBuf = [];
-  net.remoteKeys = {};
-  p1ci = 0; p2ci = 5;
-  p1sv = 0; p2sv = 0;
-  csc = {p1:false, p2:false};
-  ssc = {p1:false, p2:false};
-  stopMusic();
-  SCREEN = 'cs';
-  selSnd();
-  // Broadcast our screen state so opponent sees us move to CS
-  setTimeout(() => netBroadcastSelectState(), 300);
-}
-
 // ── MESSAGE HANDLER ───────────────────────────────────
 function onNetMessage(msg) {
-  const { type, from, data } = msg.data || {};
+  const { type, from, to, data } = msg.data || {};
   if (from === net.myName) return;
+  if (to && to !== net.myName) return;
 
-  if (type === 'state') {
-    // P1's authoritative state — P2 applies it directly
-    if (!net.isP1 && P1 && P2 && data) {
-      // Apply P1's simulation results for both players
-      const applyState = (p, s) => {
-        if (!s) return;
-        p.x = s.x; p.y = s.y; p.vx = s.vx; p.vy = s.vy;
-        p.hp = s.hp; p.spm = s.spm;
-        p.state = s.state; p.facing = s.facing;
-        p.acd = s.acd; p.hst = s.hst;
-        p.ijp = s.ijp; p.ibl = s.ibl; p.flt = s.flt;
-      };
-      applyState(P1, data.p1);
-      applyState(P2, data.p2);
-      // Also store P1's keys in remoteKeys for display
-      net._latestRemoteKeys = data.keys || {};
-    }
-  } else if (type === 'keys') {
-    // P2's keys arriving at P1 — store for next simulation frame
-    if (net.isP1 && data && data.keys) {
-      net._latestRemoteKeys = data.keys;
+  if (type === 'input') {
+    // Store real opponent input for frame data.f
+    if (data && data.f !== undefined) {
+      net.remoteInputs[data.f] = data.k || {};
     }
   } else if (type === 'match_start') {
-    // Fallback: if presence didn't trigger us, this will
     if (!net.isP1 && net.status === 'lobby') {
-      net.oppName = from;
-      netStartMatch();
+      net.oppName = from; netStartMatch();
     }
   } else if (type === 'kick') {
-    // Host kicked us
-    netDisconnect();
-    SCREEN = 'title';
-    startMusic();
+    netDisconnect(); SCREEN = 'title'; startMusic();
     alert('You were kicked from the room.');
-  } else if (type === 'keys') {
-    // Buffer incoming input with frame number
-    net.remoteBuf.push({ frame: data.frame, keys: data.keys });
-    // Keep buffer tidy
-    if (net.remoteBuf.length > 10) net.remoteBuf.shift();
   } else if (type === 'ping') {
-    netSend('pong', { t: data.t });
+    netSend('pong', { t: data.t }, from);
   } else if (type === 'pong') {
     net.pingMs = Date.now() - data.t;
   } else if (type === 'round_end') {
-    if (data.winner === 'p1') { if(!P1||!P2) return; P2.hp = 0; }
-    else { if(!P1||!P2) return; P1.hp = 0; }
+    // Sync KO — if we disagree, trust the message
+    if (data.winner === 'p1' && P2) P2.hp = Math.min(P2.hp, 0);
+    else if (P1) P1.hp = Math.min(P1.hp, 0);
+  } else if (type === 'cs_hover') {
+    if (data.player==='p1') p1ci=data.ci; else p2ci=data.ci;
+  } else if (type === 'cs_pick') {
+    if (data.player==='p1') { p1ci=data.ci; csc.p1=true; cfmSnd(); }
+    else                     { p2ci=data.ci; csc.p2=true; cfmSnd(); }
+    if (csc.p1&&csc.p2) setTimeout(()=>{ SCREEN='ss'; }, 350);
+  } else if (type === 'cs_advance') {
+    if (SCREEN==='cs'||SCREEN==='online') SCREEN='ss';
+  } else if (type === 'ss_hover') {
+    if (data.player==='p1') p1sv=data.sv; else p2sv=data.sv;
+  } else if (type === 'ss_pick') {
+    if (data.player==='p1') { p1sv=data.sv; ssc.p1=true; cfmSnd(); }
+    else                     { p2sv=data.sv; ssc.p2=true; cfmSnd(); }
+    if (ssc.p1&&ssc.p2) {
+      if(p1sv===99&&p2sv===99) stg=Math.floor(Math.random()*STAGES.length);
+      else if(p1sv===99) stg=p2sv; else if(p2sv===99) stg=p1sv;
+      else stg=p1sv===p2sv?p1sv:Math.random()<.5?p1sv:p2sv;
+      setTimeout(()=>beginCountdown(), 350);
+    }
   }
 }
 
-function netSend(type, data) {
+function netSend(type, data, to=null) {
   if (!net.channel || !net.connected) return;
-  net.channel.publish('game', { type, from: net.myName, data });
+  net.channel.publish('game', { type, from: net.myName, to, data });
 }
 
-// ── INPUT SYNC TICK (called every game frame) ─────────
-// Architecture: P1 is authoritative host.
-// - Both players send their own raw key state every frame
-// - P1 receives P2's keys, runs full simulation, sends authoritative positions to P2
-// - P2 receives P1's authoritative state and applies it directly (no local sim for P2)
-// This eliminates desync entirely at the cost of ~1 frame extra latency for P2
-
-function netTick() {
-  if (!net.enabled || !net.connected) return;
-  net.frameNum++;
-
-  const now = performance.now();
-  const snap = netKeysSnapshot();
-
-  // Always send my keys to opponent (throttled to ~60fps)
-  if (now - net.lastSent >= 14) {
-    if (net.isP1) {
-      // P1: send full authoritative game state to P2
-      if (P1 && P2) {
-        netSend('state', {
-          f: net.frameNum,
-          p1: { x:P1.x, y:P1.y, vx:P1.vx, vy:P1.vy, hp:P1.hp, spm:P1.spm,
-                state:P1.state, facing:P1.facing, acd:P1.acd, hst:P1.hst,
-                ijp:P1.ijp, ibl:P1.ibl, flt:P1.flt },
-          p2: { x:P2.x, y:P2.y, vx:P2.vx, vy:P2.vy, hp:P2.hp, spm:P2.spm,
-                state:P2.state, facing:P2.facing, acd:P2.acd, hst:P2.hst,
-                ijp:P2.ijp, ibl:P2.ibl, flt:P2.flt },
-          keys: snap,  // P1's keys for P2's reference
-        }, net.oppName);
-      }
-    } else {
-      // P2: just send my keys to P1 so P1 can simulate P2 correctly
-      netSend('keys', { f: net.frameNum, keys: snap }, net.oppName);
-    }
-    net.lastSent = now;
-  }
-
-  // Apply opponent's input
-  if (net.isP1) {
-    // P1 runs authoritative sim — remote keys drive P2
-    net.remoteKeys = net._latestRemoteKeys || {};
-  } else {
-    // P2 renders P1's authoritative state — no local physics for either player
-    // (applied directly in onNetMessage when 'state' arrives)
-    net.remoteKeys = snap; // P2's own keys (unused in rendering — P1 simulates us)
-  }
-
-  net._delayedLocalKeys = snap;
+// ── MATCH START ───────────────────────────────────────
+function netStartMatch() {
+  if (net.status === 'fighting') return;
+  net.status = 'fighting'; net.enabled = true;
+  net.frameNum = 0; net.snapshots = []; net.localInputs = [];
+  net.remoteInputs = {}; net.lastRemoteKeys = {};
+  net._myKeysThisFrame = {}; net._remoteKeysThisFrame = {};
+  p1ci=0; p2ci=5; p1sv=0; p2sv=0;
+  csc={p1:false,p2:false}; ssc={p1:false,p2:false};
+  stopMusic(); SCREEN='cs'; selSnd();
+  setTimeout(()=>netBroadcastSelectState(), 300);
 }
 
-// Returns the effective keys object for a given binding set
-// In online mode: local player uses delayed local keys, remote uses remoteKeys
-function getEffectiveKeys(isLocalPlayer) {
-  if (!net.enabled) return keys;  // local mode: raw keys
-  if (isLocalPlayer) return net._delayedLocalKeys || keys;
-  return net.remoteKeys;
-}
-
-// ── ONLINE SCREEN UI ──────────────────────────────────
-let _onlineScreen = {
-  nameInput: '', roomInput: '', role: 'p1',
-  step: 'form',   // form | lobby
-  inputFocus: 'name',
-  err: '',
-};
-let _typingName = false;
-
-function drawOnlineScreen() {
-  ctx.fillStyle = '#08080f'; ctx.fillRect(0,0,W,H);
-  ctx.textAlign = 'center';
-  ctx.font = '14px "Press Start 2P"';
-  ctx.fillStyle = '#fff'; ctx.shadowColor = '#f80'; ctx.shadowBlur = 14;
-  ctx.fillText('⚡ ONLINE MODE', W/2, 55); ctx.shadowBlur = 0;
-
-  if (_onlineScreen.step === 'form') {
-    ctx.font = '7px "Press Start 2P"'; ctx.fillStyle = '#888';
-    ctx.fillText('Both players need the same ROOM CODE to connect', W/2, 82);
-
-    // Name field
-    const nActive = _onlineScreen.inputFocus === 'name';
-    ctx.strokeStyle = nActive ? '#0df' : '#333'; ctx.lineWidth = 2;
-    ctx.strokeRect(W/2-180, 105, 360, 36);
-    ctx.fillStyle = '#0d0d18'; ctx.fillRect(W/2-179, 106, 358, 34);
-    ctx.font = '8px "Press Start 2P"';
-    ctx.fillStyle = nActive ? '#0df' : '#555'; ctx.textAlign = 'left';
-    ctx.fillText('YOUR NAME:', W/2-170, 119);
-    ctx.fillStyle = '#fff';
-    ctx.fillText((_onlineScreen.nameInput||'') + (nActive && Math.floor(Date.now()/500)%2 ? '|' : ''), W/2-170, 135);
-    ctx.textAlign = 'center';
-
-    // Room code field
-    const rActive = _onlineScreen.inputFocus === 'room';
-    ctx.strokeStyle = rActive ? '#f80' : '#333';
-    ctx.strokeRect(W/2-180, 160, 360, 36);
-    ctx.fillStyle = '#0d0d18'; ctx.fillRect(W/2-179, 161, 358, 34);
-    ctx.font = '8px "Press Start 2P"';
-    ctx.fillStyle = rActive ? '#f80' : '#555'; ctx.textAlign = 'left';
-    ctx.fillText('ROOM CODE:', W/2-170, 174);
-    ctx.fillStyle = '#fff';
-    ctx.fillText((_onlineScreen.roomInput||'') + (rActive && Math.floor(Date.now()/500)%2 ? '|' : ''), W/2-170, 190);
-    ctx.textAlign = 'center';
-
-    // Role selector
-    ctx.font = '7px "Press Start 2P"'; ctx.fillStyle = '#666';
-    ctx.fillText('I AM:', W/2, 225);
-    ['P1 (HOST)', 'P2 (JOIN)'].forEach((label, i) => {
-      const sel = (i===0&&_onlineScreen.role==='p1')||(i===1&&_onlineScreen.role==='p2');
-      ctx.strokeStyle = sel ? '#0df' : '#333'; ctx.lineWidth = 2;
-      ctx.strokeRect(W/2 - 200 + i*210, 232, 190, 28);
-      ctx.fillStyle = sel ? 'rgba(0,220,255,.15)' : '#0d0d18';
-      ctx.fillRect(W/2 - 199 + i*210, 233, 188, 26);
-      ctx.font = '7px "Press Start 2P"';
-      ctx.fillStyle = sel ? '#0df' : '#555';
-      ctx.fillText(label, W/2 - 200 + i*210 + 95, 250);
-    });
-
-    // Connect button
-    const canConnect = _onlineScreen.nameInput.length > 0 && _onlineScreen.roomInput.length > 0;
-    ctx.strokeStyle = canConnect ? '#4caf50' : '#333'; ctx.lineWidth = 2;
-    ctx.strokeRect(W/2-100, 278, 200, 34);
-    ctx.fillStyle = canConnect ? 'rgba(76,175,80,.2)' : '#0d0d18';
-    ctx.fillRect(W/2-99, 279, 198, 32);
-    ctx.font = '9px "Press Start 2P"'; ctx.fillStyle = canConnect ? '#4caf50' : '#333';
-    ctx.fillText('⚡ CONNECT', W/2, 300);
-
-    if (_onlineScreen.err) {
-      ctx.font = '6px "Press Start 2P"'; ctx.fillStyle = '#f44';
-      ctx.fillText(_onlineScreen.err, W/2, 328);
-    }
-
-    ctx.font = '6px "Press Start 2P"'; ctx.fillStyle = '#333';
-    ctx.fillText('Click fields to type  ·  TAB switches fields  ·  ENTER connects', W/2, 355);
-    ctx.fillText('ESC — back to title', W/2, 372);
-
-    // Ping display if connected
-    if (net.pingMs > 0) { ctx.fillStyle = '#4f4'; ctx.fillText(`Ping: ${net.pingMs}ms`, W/2, 390); }
-  }
-
-  if (_onlineScreen.step === 'lobby') {
-    ctx.font = '8px "Press Start 2P"'; ctx.fillStyle = '#0df';
-    ctx.fillText(`Room: ${net.roomCode}`, W/2, 105);
-    ctx.font = '7px "Press Start 2P"'; ctx.fillStyle = '#888';
-    ctx.fillText(`You: ${net.myName}  (${net.isP1?'P1 — HOST':'P2 — JOIN'})`, W/2, 130);
-    ctx.fillStyle = '#4f4';
-    ctx.fillText(net.status === 'fighting' ? '⚔️ Starting match!' : netStatusLabel, W/2, 165);
-    // Show error in red if failed
-    if (netStatusLabel.startsWith('❌') || netStatusLabel.startsWith('🔴')) {
-      ctx.fillStyle = '#f44'; ctx.font = '7px "Press Start 2P"';
-      ctx.fillText(netStatusLabel, W/2, 165);
-      ctx.font = '6px "Press Start 2P"'; ctx.fillStyle = '#666';
-      ctx.fillText('Check: internet connection, Ably key, room code', W/2, 188);
-      ctx.fillText('Open browser console (F12) for details', W/2, 204);
-    }
-    if (net.oppName) {
-      ctx.fillStyle = '#ff4'; ctx.font = '8px "Press Start 2P"';
-      ctx.fillText(`Opponent: ${net.oppName}`, W/2, 200);
-      // Kick button (P1/host only)
-      if (net.isP1) {
-        ctx.strokeStyle = '#f44'; ctx.lineWidth = 1;
-        ctx.strokeRect(W/2-60, 215, 120, 22);
-        ctx.fillStyle = '#f44'; ctx.font = '5px "Press Start 2P"';
-        ctx.fillText('[ KICK PLAYER ]', W/2, 230);
-        // Store kick button bounds for click detection
-        net._kickBtnBounds = {x:W/2-60, y:215, w:120, h:22};
-      }
-    } else {
-      // Pulse waiting text
-      const p = .5+.5*Math.sin(Date.now()*.003);
-      ctx.fillStyle = `rgba(255,200,0,${p})`; ctx.font = '7px "Press Start 2P"';
-      ctx.fillText('Waiting for opponent to join...', W/2, 200);
-      ctx.font = '6px "Press Start 2P"'; ctx.fillStyle = '#555';
-      ctx.fillText(`Share room code: ${net.roomCode}`, W/2, 225);
-    }
-    ctx.font = '6px "Press Start 2P"'; ctx.fillStyle = '#333';
-    ctx.fillText('ESC — disconnect and go back', W/2, 400);
-  }
-}
-
-let netStatusLabel = '';
-function netSetStatus(s) { netStatusLabel = s; console.log('[NET]', s); }
-function updateOnlineLobby() { /* triggers re-render automatically via loop */ }
-
-// Handle online screen keyboard / mouse input
-window.addEventListener('keydown', e => {
-  if (SCREEN !== 'online') return;
-
-  if (e.key === 'Escape') {
-    netDisconnect();
-    SCREEN = 'title'; startMusic(); return;
-  }
-
-  if (_onlineScreen.step === 'form') {
-    if (e.key === 'Tab') {
-      e.preventDefault();
-      _onlineScreen.inputFocus = _onlineScreen.inputFocus === 'name' ? 'room' : 'name';
-      return;
-    }
-    if (e.key === '1') { _onlineScreen.role = 'p1'; selSnd(); return; }
-    if (e.key === '2') { _onlineScreen.role = 'p2'; selSnd(); return; }
-
-    const field = _onlineScreen.inputFocus;
-    if (e.key === 'Backspace') {
-      if (field === 'name') _onlineScreen.nameInput = _onlineScreen.nameInput.slice(0,-1);
-      else _onlineScreen.roomInput = _onlineScreen.roomInput.slice(0,-1);
-      return;
-    }
-    if (e.key === 'Enter') {
-      doNetConnect(); return;
-    }
-    if (e.key.length === 1) {
-      if (field === 'name' && _onlineScreen.nameInput.length < 12)
-        _onlineScreen.nameInput += e.key.toUpperCase();
-      else if (field === 'room' && _onlineScreen.roomInput.length < 8)
-        _onlineScreen.roomInput += e.key.toUpperCase();
-    }
-  }
-}, true);  // capture phase so it runs before global keydown
-
-C.addEventListener('click', e => {
-  if (SCREEN !== 'online' || _onlineScreen.step !== 'form') return;
-  const r = C.getBoundingClientRect();
-  const mx = (e.clientX-r.left)*(W/r.width);
-  const my = (e.clientY-r.top)*(H/r.height);
-
-  // Kick button
-  if (net._kickBtnBounds && net.isP1 && net.oppName) {
-    const kb = net._kickBtnBounds;
-    const bx = kb.x*(W/r.width) + r.left - (r.left*(W/r.width) - r.left);
-    // Convert canvas coords back
-    if (mx >= kb.x && mx <= kb.x+kb.w && my >= kb.y && my <= kb.y+kb.h) {
-      netSend('kick', {}, net.oppName);
-      net.oppName = ''; net.onlinePlayers = {};
-      netSetStatus('✅ Player kicked.');
-      return;
-    }
-  }
-
-  // Click name field
-  if (mx >= W/2-180 && mx <= W/2+180 && my >= 105 && my <= 141)
-    { _onlineScreen.inputFocus = 'name'; return; }
-  // Click room field
-  if (mx >= W/2-180 && mx <= W/2+180 && my >= 160 && my <= 196)
-    { _onlineScreen.inputFocus = 'room'; return; }
-  // Click P1/P2 role
-  if (my >= 232 && my <= 260) {
-    if (mx >= W/2-200 && mx <= W/2+10)  { _onlineScreen.role='p1'; selSnd(); }
-    if (mx >= W/2+10  && mx <= W/2+210) { _onlineScreen.role='p2'; selSnd(); }
-    return;
-  }
-  // Click Connect
-  if (mx >= W/2-100 && mx <= W/2+100 && my >= 278 && my <= 312) {
-    doNetConnect(); return;
-  }
-});
-
-function doNetConnect() {
-  if (!_onlineScreen.nameInput.trim()) { _onlineScreen.err = 'Enter your name!'; return; }
-  if (!_onlineScreen.roomInput.trim()) { _onlineScreen.err = 'Enter a room code!'; return; }
-  _onlineScreen.err = '';
-  _onlineScreen.step = 'lobby';
-  netConnect(
-    _onlineScreen.nameInput.trim(),
-    _onlineScreen.roomInput.trim(),
-    _onlineScreen.role === 'p1'
-  );
-  cfmSnd();
-}
-
-// ── PATCH CHAR/STAGE SELECT TO SYNC PICKS ────────────
-// We intercept csc/ssc confirmations when in online mode
-// and broadcast picks so both players see the same selections
-
-const _origKeydown = null; // handled inline below in existing keydown handler
-
-// ── CS/SS ONLINE SYNC PATCHES ─────────────────────────
-// Patched into existing keydown handler by wrapping the confirm keys
-// ── SHARED SELECT STATE via Ably Presence ────────────
-// Instead of individual messages, we broadcast our full state
-// in presence.update() — fast, reliable, and both sides always in sync
-
+// ── SHARED SELECT STATE ───────────────────────────────
 function netBroadcastSelectState() {
   if (!net.channel || !net.connected) return;
   net.channel.presence.update({
-    name: net.myName,
-    isP1: net.isP1,
-    screen: SCREEN,
-    p1ci, p2ci, p1sv, p2sv,
-    csc_p1: csc.p1, csc_p2: csc.p2,
-    ssc_p1: ssc.p1, ssc_p2: ssc.p2,
+    name:net.myName, isP1:net.isP1, screen:SCREEN,
+    p1ci,p2ci,p1sv,p2sv,
+    csc_p1:csc.p1,csc_p2:csc.p2,
+    ssc_p1:ssc.p1,ssc_p2:ssc.p2,
   });
 }
 
-// Called whenever we receive a presence update from opponent
 function applyRemoteSelectState(data) {
   if (!data) return;
-  // Merge their state into ours
   if (data.isP1) {
-    // They are P1 — take their p1 values
-    p1ci = data.p1ci ?? p1ci;
-    p1sv = data.p1sv ?? p1sv;
-    csc.p1 = data.csc_p1 ?? csc.p1;
-    ssc.p1 = data.ssc_p1 ?? ssc.p1;
+    p1ci=data.p1ci??p1ci; p1sv=data.p1sv??p1sv;
+    csc.p1=data.csc_p1??csc.p1; ssc.p1=data.ssc_p1??ssc.p1;
   } else {
-    // They are P2 — take their p2 values
-    p2ci = data.p2ci ?? p2ci;
-    p2sv = data.p2sv ?? p2sv;
-    csc.p2 = data.csc_p2 ?? csc.p2;
-    ssc.p2 = data.ssc_p2 ?? ssc.p2;
+    p2ci=data.p2ci??p2ci; p2sv=data.p2sv??p2sv;
+    csc.p2=data.csc_p2??csc.p2; ssc.p2=data.ssc_p2??ssc.p2;
   }
-  // Sync screen transitions
-  if (data.screen === 'cs' && SCREEN === 'online') {
-    netStartMatch();
-  }
-  if (data.screen === 'ss' && SCREEN === 'cs' && csc.p1 && csc.p2) {
-    setTimeout(()=>{ SCREEN='ss'; }, 50);
-  }
-  if (data.csc_p1 && data.csc_p2 && SCREEN === 'cs') {
-    setTimeout(()=>{ SCREEN='ss'; }, 350);
-  }
-  if (data.ssc_p1 && data.ssc_p2 && SCREEN === 'ss') {
+  if (data.screen==='cs' && SCREEN==='online') netStartMatch();
+  if (data.csc_p1&&data.csc_p2&&SCREEN==='cs') setTimeout(()=>{ SCREEN='ss'; },350);
+  if (data.ssc_p1&&data.ssc_p2&&SCREEN==='ss') {
     if(p1sv===99&&p2sv===99) stg=Math.floor(Math.random()*STAGES.length);
-    else if(p1sv===99) stg=p2sv;
-    else if(p2sv===99) stg=p1sv;
+    else if(p1sv===99) stg=p2sv; else if(p2sv===99) stg=p1sv;
     else stg=p1sv===p2sv?p1sv:Math.random()<.5?p1sv:p2sv;
     setTimeout(()=>beginCountdown(),350);
   }
 }
 
-// ── OVERRIDE upP IN MAIN LOOP TO USE NET KEYS ─────────
-// The main loop calls: upP(P1,P2,B1); upP(P2,P1,B2);
-// In online mode we need to redirect B2 to net.remoteKeys
-// We do this by making B1/B2 read from getEffectiveKeys()
+// ── ONLINE SCREEN UI ──────────────────────────────────
+const _onlineScreen = { nameInput:'', roomInput:'', role:'p1', step:'form', inputFocus:'name', err:'' };
+let netStatusLabel = '';
+function netSetStatus(s) { netStatusLabel = s; console.log('[NET]', s); }
+function updateOnlineLobby() {}
 
-// Mark which player is local vs remote
+function drawOnlineScreen() {
+  ctx.fillStyle='#08080f';ctx.fillRect(0,0,W,H);
+  ctx.textAlign='center';
+  ctx.font='14px "Press Start 2P"';ctx.fillStyle='#fff';
+  ctx.shadowColor='#f80';ctx.shadowBlur=14;
+  ctx.fillText('⚡ ONLINE MODE',W/2,55);ctx.shadowBlur=0;
+
+  if (_onlineScreen.step==='form') {
+    ctx.font='7px "Press Start 2P"';ctx.fillStyle='#888';
+    ctx.fillText('Both players need the same ROOM CODE',W/2,78);
+
+    // Name field
+    const nA=_onlineScreen.inputFocus==='name';
+    ctx.strokeStyle=nA?'#0df':'#333';ctx.lineWidth=2;
+    ctx.strokeRect(W/2-180,100,360,36);
+    ctx.fillStyle='#0d0d18';ctx.fillRect(W/2-179,101,358,34);
+    ctx.font='8px "Press Start 2P"';
+    ctx.fillStyle=nA?'#0df':'#555';ctx.textAlign='left';
+    ctx.fillText('YOUR NAME:',W/2-170,114);
+    ctx.fillStyle='#fff';
+    ctx.fillText((_onlineScreen.nameInput||'')+(nA&&Math.floor(Date.now()/500)%2?'|':''),W/2-170,130);
+    ctx.textAlign='center';
+
+    // Room field
+    const rA=_onlineScreen.inputFocus==='room';
+    ctx.strokeStyle=rA?'#f80':'#333';
+    ctx.strokeRect(W/2-180,152,360,36);
+    ctx.fillStyle='#0d0d18';ctx.fillRect(W/2-179,153,358,34);
+    ctx.font='8px "Press Start 2P"';
+    ctx.fillStyle=rA?'#f80':'#555';ctx.textAlign='left';
+    ctx.fillText('ROOM CODE:',W/2-170,166);
+    ctx.fillStyle='#fff';
+    ctx.fillText((_onlineScreen.roomInput||'')+(rA&&Math.floor(Date.now()/500)%2?'|':''),W/2-170,182);
+    ctx.textAlign='center';
+
+    // Role
+    ctx.font='6px "Press Start 2P"';ctx.fillStyle='#666';ctx.fillText('I AM:',W/2,218);
+    ['P1 (HOST)','P2 (JOIN)'].forEach((label,i)=>{
+      const sel=(i===0&&_onlineScreen.role==='p1')||(i===1&&_onlineScreen.role==='p2');
+      ctx.strokeStyle=sel?'#0df':'#333';ctx.lineWidth=2;
+      ctx.strokeRect(W/2-200+i*210,225,190,28);
+      ctx.fillStyle=sel?'rgba(0,220,255,.15)':'#0d0d18';ctx.fillRect(W/2-199+i*210,226,188,26);
+      ctx.font='7px "Press Start 2P"';ctx.fillStyle=sel?'#0df':'#555';
+      ctx.fillText(label,W/2-200+i*210+95,243);
+    });
+
+    // Connect button
+    const can=_onlineScreen.nameInput.length>0&&_onlineScreen.roomInput.length>0;
+    ctx.strokeStyle=can?'#4caf50':'#333';ctx.lineWidth=2;
+    ctx.strokeRect(W/2-100,270,200,34);
+    ctx.fillStyle=can?'rgba(76,175,80,.2)':'#0d0d18';ctx.fillRect(W/2-99,271,198,32);
+    ctx.font='9px "Press Start 2P"';ctx.fillStyle=can?'#4caf50':'#333';
+    ctx.fillText('⚡ CONNECT',W/2,293);
+
+    if(_onlineScreen.err){ctx.font='6px "Press Start 2P"';ctx.fillStyle='#f44';ctx.fillText(_onlineScreen.err,W/2,320);}
+    ctx.font='6px "Press Start 2P"';ctx.fillStyle='#333';
+    ctx.fillText('Click fields to type · TAB switches · ENTER connects',W/2,348);
+    ctx.fillText('ESC — back to title',W/2,364);
+
+    // Ping
+    if(net.pingMs>0){ctx.fillStyle='#4f4';ctx.fillText(`Ping: ${net.pingMs}ms`,W/2,382);}
+
+    // Rollback badge
+    ctx.font='5px "Press Start 2P"';ctx.fillStyle='#4b9cd3';
+    ctx.fillText('⚡ ROLLBACK NETCODE — Zero input lag for both players',W/2,400);
+  }
+
+  if (_onlineScreen.step==='lobby') {
+    ctx.font='8px "Press Start 2P"';ctx.fillStyle='#0df';
+    ctx.fillText(`Room: ${net.roomCode}`,W/2,105);
+    ctx.font='7px "Press Start 2P"';ctx.fillStyle='#888';
+    ctx.fillText(`You: ${net.myName}  (${net.isP1?'P1 — HOST':'P2 — JOIN'})`,W/2,128);
+
+    const isErr=netStatusLabel.startsWith('❌')||netStatusLabel.startsWith('🔴');
+    ctx.fillStyle=isErr?'#f44':'#4f4';ctx.font='7px "Press Start 2P"';
+    ctx.fillText(netStatusLabel,W/2,158);
+    if(isErr){
+      ctx.font='5px "Press Start 2P"';ctx.fillStyle='#666';
+      ctx.fillText('Check internet · Open F12 Console for details',W/2,174);
+    }
+
+    if(net.oppName){
+      ctx.fillStyle='#ff4';ctx.font='8px "Press Start 2P"';
+      ctx.fillText(`Opponent: ${net.oppName}`,W/2,195);
+      if(net.isP1){
+        ctx.strokeStyle='#f44';ctx.lineWidth=1;ctx.strokeRect(W/2-55,208,110,20);
+        ctx.fillStyle='#f44';ctx.font='5px "Press Start 2P"';ctx.fillText('[ KICK PLAYER ]',W/2,221);
+        net._kickBtnBounds={x:W/2-55,y:208,w:110,h:20};
+      }
+      if(net.pingMs>0){ctx.font='5px "Press Start 2P"';ctx.fillStyle='#4f4';ctx.fillText(`Ping: ${net.pingMs}ms`,W/2,238);}
+    } else {
+      const p=.5+.5*Math.sin(Date.now()*.003);
+      ctx.fillStyle=`rgba(255,200,0,${p})`;ctx.font='7px "Press Start 2P"';
+      ctx.fillText('Waiting for opponent...',W/2,195);
+      ctx.font='5px "Press Start 2P"';ctx.fillStyle='#555';
+      ctx.fillText(`Share code: ${net.roomCode}`,W/2,215);
+    }
+    ctx.font='5px "Press Start 2P"';ctx.fillStyle='#333';
+    ctx.fillText('ESC — disconnect and go back',W/2,410);
+  }
+}
+
+// Online screen keyboard input (capture phase — runs before global handler)
+window.addEventListener('keydown', e => {
+  if (SCREEN !== 'online') return;
+  if (e.key==='Escape') { netDisconnect(); SCREEN='title'; startMusic(); return; }
+  if (_onlineScreen.step==='form') {
+    if (e.key==='Tab') { e.preventDefault(); _onlineScreen.inputFocus=_onlineScreen.inputFocus==='name'?'room':'name'; return; }
+    if (e.key==='1') { _onlineScreen.role='p1'; selSnd(); return; }
+    if (e.key==='2') { _onlineScreen.role='p2'; selSnd(); return; }
+    const field=_onlineScreen.inputFocus;
+    if (e.key==='Backspace') {
+      if(field==='name') _onlineScreen.nameInput=_onlineScreen.nameInput.slice(0,-1);
+      else _onlineScreen.roomInput=_onlineScreen.roomInput.slice(0,-1);
+      return;
+    }
+    if (e.key==='Enter') { doNetConnect(); return; }
+    if (e.key.length===1) {
+      if(field==='name'&&_onlineScreen.nameInput.length<12) _onlineScreen.nameInput+=e.key.toUpperCase();
+      else if(field==='room'&&_onlineScreen.roomInput.length<8) _onlineScreen.roomInput+=e.key.toUpperCase();
+    }
+  }
+}, true);
+
+C.addEventListener('click', e => {
+  if (SCREEN!=='online') return;
+  const r=C.getBoundingClientRect();
+  const mx=(e.clientX-r.left)*(W/r.width);
+  const my=(e.clientY-r.top)*(H/r.height);
+
+  // Kick button
+  if(net._kickBtnBounds&&net.isP1&&net.oppName){
+    const kb=net._kickBtnBounds;
+    if(mx>=kb.x&&mx<=kb.x+kb.w&&my>=kb.y&&my<=kb.y+kb.h){
+      netSend('kick',{},net.oppName); net.oppName=''; net.onlinePlayers={};
+      netSetStatus('✅ Player kicked.'); return;
+    }
+  }
+
+  if (_onlineScreen.step!=='form') return;
+  if(mx>=W/2-180&&mx<=W/2+180&&my>=100&&my<=136){_onlineScreen.inputFocus='name';return;}
+  if(mx>=W/2-180&&mx<=W/2+180&&my>=152&&my<=188){_onlineScreen.inputFocus='room';return;}
+  if(my>=225&&my<=253){
+    if(mx>=W/2-200&&mx<=W/2+10){_onlineScreen.role='p1';selSnd();}
+    if(mx>=W/2+10&&mx<=W/2+210){_onlineScreen.role='p2';selSnd();}
+    return;
+  }
+  if(mx>=W/2-100&&mx<=W/2+100&&my>=270&&my<=304){doNetConnect();return;}
+});
+
+function doNetConnect() {
+  if(!_onlineScreen.nameInput.trim()){_onlineScreen.err='Enter your name!';return;}
+  if(!_onlineScreen.roomInput.trim()){_onlineScreen.err='Enter a room code!';return;}
+  _onlineScreen.err=''; _onlineScreen.step='lobby';
+  netConnect(_onlineScreen.nameInput.trim(), _onlineScreen.roomInput.trim(), _onlineScreen.role==='p1');
+  cfmSnd();
+}
+
+// ── MARK WHICH PLAYER IS LOCAL ────────────────────────
 function netIsLocalP1() { return net.isP1; }
 function netIsLocalP2() { return !net.isP1; }
 
 // ── ROUND END SYNC ────────────────────────────────────
-// endRound is patched directly above to include net sync
+// endRound is patched directly at source to include net sync
 
-// ═══════════════════════════════════════════════════════
-// ═══════════════════════════════════════════════════════
 
 // ===== MAIN LOOP =====
 let lt=performance.now();
@@ -6311,24 +6319,18 @@ function loop(now){
       if(countdown>=0){updateCountdown();}
       else if(gst==='fight'&&cdDone){
         rTick++;if(rTick>=60){rTick=0;rTimer--;if(rTimer<=0){gst='ko';endRound(P1.hp>=P2.hp?P1:P2);}}
-        // Online: tick network
+        // Rollback netcode tick (snapshots state, sends inputs, handles rollback)
         if(net.enabled) netTick();
 
-        if(!net.enabled || net.isP1) {
-          // Local or P1 host: run full simulation
-          const _B1keys = net.enabled ? (net._delayedLocalKeys||keys) : keys;
-          const _B2keys = net.enabled ? (net._latestRemoteKeys||{}) : keys;
-          const _savedKeys = Object.assign({},keys);
-          if(net.enabled){ Object.keys(keys).forEach(k=>delete keys[k]); Object.assign(keys,_B1keys); }
-          upP(P1,P2,B1);
-          if(net.enabled){ Object.keys(keys).forEach(k=>delete keys[k]); Object.assign(keys,_B2keys); }
-          upP(P2,P1,B2);
-          if(net.enabled){ Object.keys(keys).forEach(k=>delete keys[k]); Object.assign(keys,_savedKeys); }
-        } else {
-          // P2: don't run local physics — P1 sends authoritative state
-          // Only process local P2 keys for sending (done in netTick)
-          // Still need to update HUD
-        }
+        // Apply this frame's simulation
+        const _p1Keys = net.enabled ? (net.isP1 ? net._myKeysThisFrame : net._remoteKeysThisFrame) : keys;
+        const _p2Keys = net.enabled ? (net.isP1 ? net._remoteKeysThisFrame : net._myKeysThisFrame) : keys;
+        const _savedKeys = Object.assign({},keys);
+        Object.keys(keys).forEach(k=>delete keys[k]); Object.assign(keys,_p1Keys);
+        upP(P1,P2,B1);
+        Object.keys(keys).forEach(k=>delete keys[k]); Object.assign(keys,_p2Keys);
+        upP(P2,P1,B2);
+        Object.keys(keys).forEach(k=>delete keys[k]); Object.assign(keys,_savedKeys);
         updHUD();
         updateProjs(P1,P2);updateGasClouds(P1,P2);
         updateSneezeClouds(P1,P2);
