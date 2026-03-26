@@ -5829,10 +5829,14 @@ function onPresence(msg) {
   if (msg.action === 'enter' || msg.action === 'update') {
     net.onlinePlayers[msg.clientId] = msg.data;
     net.oppName = msg.clientId;
-    // Both players present → start CS on both sides
-    if (net.status === 'lobby') {
+    // Only P1 (host) triggers match start when opponent arrives
+    if (net.status === 'lobby' && net.isP1) {
       netSetStatus(`⚔️ ${net.oppName} joined! Starting in 2s...`);
-      setTimeout(() => netStartMatch(), 2000);
+      setTimeout(() => {
+        netStartMatch();
+        // Broadcast to P2 that match is starting
+        netSend('match_start', { p1Name: net.myName, p2Name: net.oppName });
+      }, 2000);
     }
   } else if (msg.action === 'leave') {
     delete net.onlinePlayers[msg.clientId];
@@ -5845,16 +5849,20 @@ function onPresence(msg) {
 }
 
 function netStartMatch() {
+  if (net.status === 'fighting') return; // already started
   net.status   = 'fighting';
   net.enabled  = true;
   net.frameNum = 0;
   net.localBuf = [];
   net.remoteBuf = [];
   net.remoteKeys = {};
+  // Reset character/stage select state
+  p1ci = 0; p2ci = 5;
+  p1sv = 0; p2sv = 0;
+  csc = {p1:false, p2:false};
+  ssc = {p1:false, p2:false};
   stopMusic();
   SCREEN = 'cs';
-  // Override which player controls which character
-  // net.isP1 → controls P1 (B1 keys), opponent drives P2 via remoteKeys
   selSnd();
 }
 
@@ -5863,7 +5871,14 @@ function onNetMessage(msg) {
   const { type, from, data } = msg.data || {};
   if (from === net.myName) return;
 
-  if (type === 'keys') {
+  if (type === 'match_start') {
+    // P1 sent this — P2 transitions to CS
+    if (!net.isP1 && net.status === 'lobby') {
+      net.oppName = from;
+      netSetStatus(`⚔️ Match starting!`);
+      netStartMatch();
+    }
+  } else if (type === 'keys') {
     // Buffer incoming input with frame number
     net.remoteBuf.push({ frame: data.frame, keys: data.keys });
     // Keep buffer tidy
