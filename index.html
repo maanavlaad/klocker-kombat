@@ -5292,10 +5292,15 @@ function drawCS(){
   ctx.fillText('P1: R key  |  P2: 0 key',W/2,ry+cH-4);
 
   ctx.textAlign='center';ctx.font='6px "Press Start 2P"';
-  if(!csc.p1){ctx.fillStyle='#4af';ctx.fillText('P1: F to confirm',W/2,H-34);}
+  if(!csc.p1){ctx.fillStyle=net.enabled&&!net.isP1?'#555':'#4af';ctx.fillText(net.enabled&&!net.isP1?'P1 is choosing...':'P1: F to confirm',W/2,H-42);}
   else{ctx.fillStyle='#4f4';ctx.shadowColor='#4f4';ctx.shadowBlur=5;ctx.fillText('P1 LOCKED IN!',W/4,H-34);ctx.shadowBlur=0;}
-  if(!csc.p2){ctx.fillStyle='#f84';ctx.fillText('P2: , to confirm',W/2,H-18);}
+  if(!csc.p2){ctx.fillStyle=net.enabled&&net.isP1?'#555':'#f84';ctx.fillText(net.enabled&&net.isP1?'P2 is choosing...':'P2: , to confirm',W/2,H-26);}
   else{ctx.fillStyle='#4f4';ctx.shadowColor='#4f4';ctx.shadowBlur=5;ctx.fillText('P2 LOCKED IN!',3*W/4,H-18);ctx.shadowBlur=0;}
+  if(net.enabled){
+    ctx.font='5px "Press Start 2P"';ctx.fillStyle='#4f4';ctx.shadowColor='#4f4';ctx.shadowBlur=4;
+    ctx.fillText(`You are ${net.isP1?'P1 → A/D to browse, F to lock in':'P2 → ←/→ to browse, , to lock in'}`,W/2,H-10);
+    ctx.shadowBlur=0;
+  }
 }
 
 // ===== STAGE SELECT =====
@@ -5546,7 +5551,11 @@ function showInfo(){
 // ===== INPUT =====
 window.addEventListener('keydown',e=>{
   const now=Date.now();
-  if(e.key==='i'||e.key==='I'){showInfo();return;}
+  // Don't trigger info overlay while typing in the online name form
+  if(e.key==='i'||e.key==='I'){
+    if(SCREEN==='online' && _onlineScreen.step==='form') { /* typing, ignore */ }
+    else { showInfo(); return; }
+  }
 
   if(SCREEN==='title'){
     if(e.key==='Enter'){AC.resume();stopMusic();SCREEN='cs';selSnd();}
@@ -5569,68 +5578,77 @@ window.addEventListener('keydown',e=>{
   }
   if(SCREEN==='cs'){
     if(now-_csD<130)return;
-    if(!csc.p1){
-      if(e.key==='a'){p1ci=(p1ci-1+6)%6;selSnd();_csD=now;}
-      if(e.key==='d'){p1ci=(p1ci+1)%6;selSnd();_csD=now;}
-      if(e.key==='r'||e.key==='R'){
-        // RANDOM: pick now, show as 99, reveal on fight start
-        p1ci=99;selSnd();_csD=now;
+
+    // In online mode: P1 controls p1ci, P2 controls p2ci
+    // Each player can browse freely and broadcasts every change
+    const amP1 = !net.enabled || net.isP1;
+    const amP2 = !net.enabled || !net.isP1;
+
+    if(!csc.p1 && amP1){
+      if(e.key==='a'||e.key==='d'||e.key==='r'||e.key==='R'){
+        if(e.key==='a') p1ci=(p1ci-1+6)%6;
+        else if(e.key==='d') p1ci=(p1ci+1)%6;
+        else p1ci=99;
+        selSnd();_csD=now;
+        if(net.enabled) netSend('cs_hover',{ci:p1ci,player:'p1'});
       }
       if(e.key==='f'){
-        // In online mode, only the P1-role player can confirm P1
-        if(net.enabled && !net.isP1) return;
         if(p1ci===99) p1ci=Math.floor(Math.random()*CHARS.length);
         csc.p1=true;cfmSnd();_csD=now;
-        netSyncCsPick(p1ci);
+        if(net.enabled) netSend('cs_pick',{ci:p1ci,player:'p1'});
       }
     }
-    if(!csc.p2){
-      if(e.key==='ArrowLeft'){p2ci=(p2ci-1+6)%6;selSnd();_csD=now;}
-      if(e.key==='ArrowRight'){p2ci=(p2ci+1)%6;selSnd();_csD=now;}
-      if(e.key==='0'){
-        p2ci=99;selSnd();_csD=now;
+    if(!csc.p2 && amP2){
+      if(e.key==='ArrowLeft'||e.key==='ArrowRight'||e.key==='0'){
+        if(e.key==='ArrowLeft') p2ci=(p2ci-1+6)%6;
+        else if(e.key==='ArrowRight') p2ci=(p2ci+1)%6;
+        else p2ci=99;
+        selSnd();_csD=now;
+        if(net.enabled) netSend('cs_hover',{ci:p2ci,player:'p2'});
       }
       if(e.key===','){
-        // In online mode, only the P2-role player can confirm P2
-        if(net.enabled && net.isP1) return;
         if(p2ci===99) p2ci=Math.floor(Math.random()*CHARS.length);
         csc.p2=true;cfmSnd();_csD=now;
-        netSyncCsPick(p2ci);
+        if(net.enabled) netSend('cs_pick',{ci:p2ci,player:'p2'});
       }
     }
-    // In online mode, auto-confirm the opponent's slot when we receive their pick (via onNetMessage)
-    if(net.enabled){
-      if(net.isP1 && !csc.p2 && p2ci!==undefined && p2ci!==null) {/* wait for remote */}
-      if(!net.isP1 && !csc.p1 && p1ci!==undefined) {/* wait for remote */}
-    }
-    if(csc.p1&&csc.p2)setTimeout(()=>{SCREEN='ss';},350);
+    if(csc.p1&&csc.p2)setTimeout(()=>{SCREEN='ss';if(net.enabled)netSend('cs_advance',{});},350);
   }
   if(SCREEN==='ss'){
     if(now-_ssD<150)return;
-    if(!ssc.p1){
-      if(e.key==='a'){p1sv=(p1sv-1+STAGES.length)%STAGES.length;selSnd();_ssD=now;}
-      if(e.key==='d'){p1sv=(p1sv+1)%STAGES.length;selSnd();_ssD=now;}
-      if(e.key==='r'||e.key==='R'){p1sv=99;selSnd();_ssD=now;}
+
+    const amP1 = !net.enabled || net.isP1;
+    const amP2 = !net.enabled || !net.isP1;
+
+    if(!ssc.p1 && amP1){
+      if(e.key==='a'||e.key==='d'||e.key==='r'||e.key==='R'){
+        if(e.key==='a') p1sv=(p1sv-1+STAGES.length)%STAGES.length;
+        else if(e.key==='d') p1sv=(p1sv+1)%STAGES.length;
+        else p1sv=99;
+        selSnd();_ssD=now;
+        if(net.enabled) netSend('ss_hover',{sv:p1sv,player:'p1'});
+      }
       if(e.key==='f'){
-        if(net.enabled && !net.isP1) return;
         if(p1sv===99) p1sv=Math.floor(Math.random()*STAGES.length);
         ssc.p1=true;cfmSnd();_ssD=now;
-        netSyncSsPick(p1sv);
+        if(net.enabled) netSend('ss_pick',{sv:p1sv,player:'p1'});
       }
     }
-    if(!ssc.p2){
-      if(e.key==='ArrowLeft'){p2sv=(p2sv-1+STAGES.length)%STAGES.length;selSnd();_ssD=now;}
-      if(e.key==='ArrowRight'){p2sv=(p2sv+1)%STAGES.length;selSnd();_ssD=now;}
-      if(e.key==='0'){p2sv=99;selSnd();_ssD=now;}
+    if(!ssc.p2 && amP2){
+      if(e.key==='ArrowLeft'||e.key==='ArrowRight'||e.key==='0'){
+        if(e.key==='ArrowLeft') p2sv=(p2sv-1+STAGES.length)%STAGES.length;
+        else if(e.key==='ArrowRight') p2sv=(p2sv+1)%STAGES.length;
+        else p2sv=99;
+        selSnd();_ssD=now;
+        if(net.enabled) netSend('ss_hover',{sv:p2sv,player:'p2'});
+      }
       if(e.key===','){
-        if(net.enabled && net.isP1) return;
         if(p2sv===99) p2sv=Math.floor(Math.random()*STAGES.length);
         ssc.p2=true;cfmSnd();_ssD=now;
-        netSyncSsPick(p2sv);
+        if(net.enabled) netSend('ss_pick',{sv:p2sv,player:'p2'});
       }
     }
     if(ssc.p1&&ssc.p2){
-      // both random = full random stage
       if(p1sv===99&&p2sv===99) stg=Math.floor(Math.random()*STAGES.length);
       else if(p1sv===99) stg=p2sv;
       else if(p2sv===99) stg=p1sv;
@@ -5811,9 +5829,8 @@ function onPresence(msg) {
   if (msg.action === 'enter' || msg.action === 'update') {
     net.onlinePlayers[msg.clientId] = msg.data;
     net.oppName = msg.clientId;
-    // Both players present → start CS
-    const count = Object.keys(net.onlinePlayers).length;
-    if (count >= 1 && net.status === 'lobby') {
+    // Both players present → start CS on both sides
+    if (net.status === 'lobby') {
       netSetStatus(`⚔️ ${net.oppName} joined! Starting in 2s...`);
       setTimeout(() => netStartMatch(), 2000);
     }
@@ -5859,14 +5876,27 @@ function onNetMessage(msg) {
     // Sync round result to avoid desync on KO detection
     if (data.winner === 'p1') { if(!P1||!P2) return; P2.hp = 0; }
     else { if(!P1||!P2) return; P1.hp = 0; }
+  } else if (type === 'cs_hover') {
+    // Opponent moved their cursor — update our local view
+    if (data.player === 'p1') p1ci = data.ci;
+    else p2ci = data.ci;
+
   } else if (type === 'cs_pick') {
-    // Opponent locked in their character — auto-confirm their slot
-    if (net.isP1) { p2ci = data.ci; csc.p2 = true; cfmSnd(); }
-    else           { p1ci = data.ci; csc.p1 = true; cfmSnd(); }
-    if(csc.p1&&csc.p2) setTimeout(()=>{SCREEN='ss';},350);
+    if (data.player === 'p1') { p1ci = data.ci; csc.p1 = true; cfmSnd(); }
+    else                       { p2ci = data.ci; csc.p2 = true; cfmSnd(); }
+    if(csc.p1&&csc.p2) setTimeout(()=>{ SCREEN='ss'; },350);
+
+  } else if (type === 'cs_advance') {
+    // Host told everyone to advance to stage select
+    SCREEN = 'ss';
+
+  } else if (type === 'ss_hover') {
+    if (data.player === 'p1') p1sv = data.sv;
+    else p2sv = data.sv;
+
   } else if (type === 'ss_pick') {
-    if (net.isP1) { p2sv = data.sv; ssc.p2 = true; cfmSnd(); }
-    else           { p1sv = data.sv; ssc.p1 = true; cfmSnd(); }
+    if (data.player === 'p1') { p1sv = data.sv; ssc.p1 = true; cfmSnd(); }
+    else                       { p2sv = data.sv; ssc.p2 = true; cfmSnd(); }
     if(ssc.p1&&ssc.p2){
       if(p1sv===99&&p2sv===99) stg=Math.floor(Math.random()*STAGES.length);
       else if(p1sv===99) stg=p2sv;
