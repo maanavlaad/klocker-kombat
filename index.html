@@ -5579,8 +5579,6 @@ window.addEventListener('keydown',e=>{
   if(SCREEN==='cs'){
     if(now-_csD<130)return;
 
-    // In online mode: P1 controls p1ci, P2 controls p2ci
-    // Each player can browse freely and broadcasts every change
     const amP1 = !net.enabled || net.isP1;
     const amP2 = !net.enabled || !net.isP1;
 
@@ -5590,12 +5588,12 @@ window.addEventListener('keydown',e=>{
         else if(e.key==='d') p1ci=(p1ci+1)%6;
         else p1ci=99;
         selSnd();_csD=now;
-        if(net.enabled) netSend('cs_hover',{ci:p1ci,player:'p1'});
+        netBroadcastSelectState();
       }
       if(e.key==='f'){
         if(p1ci===99) p1ci=Math.floor(Math.random()*CHARS.length);
         csc.p1=true;cfmSnd();_csD=now;
-        if(net.enabled) netSend('cs_pick',{ci:p1ci,player:'p1'});
+        netBroadcastSelectState();
       }
     }
     if(!csc.p2 && amP2){
@@ -5604,15 +5602,15 @@ window.addEventListener('keydown',e=>{
         else if(e.key==='ArrowRight') p2ci=(p2ci+1)%6;
         else p2ci=99;
         selSnd();_csD=now;
-        if(net.enabled) netSend('cs_hover',{ci:p2ci,player:'p2'});
+        netBroadcastSelectState();
       }
       if(e.key===','){
         if(p2ci===99) p2ci=Math.floor(Math.random()*CHARS.length);
         csc.p2=true;cfmSnd();_csD=now;
-        if(net.enabled) netSend('cs_pick',{ci:p2ci,player:'p2'});
+        netBroadcastSelectState();
       }
     }
-    if(csc.p1&&csc.p2)setTimeout(()=>{SCREEN='ss';if(net.enabled)netSend('cs_advance',{});},350);
+    if(csc.p1&&csc.p2){ netBroadcastSelectState(); setTimeout(()=>{SCREEN='ss';},350); }
   }
   if(SCREEN==='ss'){
     if(now-_ssD<150)return;
@@ -5626,12 +5624,12 @@ window.addEventListener('keydown',e=>{
         else if(e.key==='d') p1sv=(p1sv+1)%STAGES.length;
         else p1sv=99;
         selSnd();_ssD=now;
-        if(net.enabled) netSend('ss_hover',{sv:p1sv,player:'p1'});
+        netBroadcastSelectState();
       }
       if(e.key==='f'){
         if(p1sv===99) p1sv=Math.floor(Math.random()*STAGES.length);
         ssc.p1=true;cfmSnd();_ssD=now;
-        if(net.enabled) netSend('ss_pick',{sv:p1sv,player:'p1'});
+        netBroadcastSelectState();
       }
     }
     if(!ssc.p2 && amP2){
@@ -5640,15 +5638,16 @@ window.addEventListener('keydown',e=>{
         else if(e.key==='ArrowRight') p2sv=(p2sv+1)%STAGES.length;
         else p2sv=99;
         selSnd();_ssD=now;
-        if(net.enabled) netSend('ss_hover',{sv:p2sv,player:'p2'});
+        netBroadcastSelectState();
       }
       if(e.key===','){
         if(p2sv===99) p2sv=Math.floor(Math.random()*STAGES.length);
         ssc.p2=true;cfmSnd();_ssD=now;
-        if(net.enabled) netSend('ss_pick',{sv:p2sv,player:'p2'});
+        netBroadcastSelectState();
       }
     }
     if(ssc.p1&&ssc.p2){
+      netBroadcastSelectState();
       if(p1sv===99&&p2sv===99) stg=Math.floor(Math.random()*STAGES.length);
       else if(p1sv===99) stg=p2sv;
       else if(p2sv===99) stg=p1sv;
@@ -5826,18 +5825,24 @@ function netDisconnect() {
 // ── PRESENCE ──────────────────────────────────────────
 function onPresence(msg) {
   if (msg.clientId === net.myName) return;
+
   if (msg.action === 'enter' || msg.action === 'update') {
     net.onlinePlayers[msg.clientId] = msg.data;
     net.oppName = msg.clientId;
-    // Only P1 (host) triggers match start when opponent arrives
-    if (net.status === 'lobby' && net.isP1) {
-      netSetStatus(`⚔️ ${net.oppName} joined! Starting in 2s...`);
+
+    if (net.status === 'lobby') {
+      // Someone joined our room — start match on our end
+      netSetStatus(`⚔️ ${net.oppName} connected!`);
       setTimeout(() => {
         netStartMatch();
-        // Broadcast to P2 that match is starting
-        netSend('match_start', { p1Name: net.myName, p2Name: net.oppName });
-      }, 2000);
+        // Immediately broadcast our state so opponent sees us on CS
+        setTimeout(() => netBroadcastSelectState(), 200);
+      }, 500);
+    } else if (net.status === 'fighting') {
+      // Already in match — apply their select state
+      applyRemoteSelectState(msg.data);
     }
+
   } else if (msg.action === 'leave') {
     delete net.onlinePlayers[msg.clientId];
     if (msg.clientId === net.oppName) {
@@ -5849,14 +5854,13 @@ function onPresence(msg) {
 }
 
 function netStartMatch() {
-  if (net.status === 'fighting') return; // already started
+  if (net.status === 'fighting') return;
   net.status   = 'fighting';
   net.enabled  = true;
   net.frameNum = 0;
   net.localBuf = [];
   net.remoteBuf = [];
   net.remoteKeys = {};
-  // Reset character/stage select state
   p1ci = 0; p2ci = 5;
   p1sv = 0; p2sv = 0;
   csc = {p1:false, p2:false};
@@ -5864,6 +5868,8 @@ function netStartMatch() {
   stopMusic();
   SCREEN = 'cs';
   selSnd();
+  // Broadcast our screen state so opponent sees us move to CS
+  setTimeout(() => netBroadcastSelectState(), 300);
 }
 
 // ── MESSAGE HANDLER ───────────────────────────────────
@@ -5872,12 +5878,17 @@ function onNetMessage(msg) {
   if (from === net.myName) return;
 
   if (type === 'match_start') {
-    // P1 sent this — P2 transitions to CS
+    // Fallback: if presence didn't trigger us, this will
     if (!net.isP1 && net.status === 'lobby') {
       net.oppName = from;
-      netSetStatus(`⚔️ Match starting!`);
       netStartMatch();
     }
+  } else if (type === 'kick') {
+    // Host kicked us
+    netDisconnect();
+    SCREEN = 'title';
+    startMusic();
+    alert('You were kicked from the room.');
   } else if (type === 'keys') {
     // Buffer incoming input with frame number
     net.remoteBuf.push({ frame: data.frame, keys: data.keys });
@@ -5888,37 +5899,8 @@ function onNetMessage(msg) {
   } else if (type === 'pong') {
     net.pingMs = Date.now() - data.t;
   } else if (type === 'round_end') {
-    // Sync round result to avoid desync on KO detection
     if (data.winner === 'p1') { if(!P1||!P2) return; P2.hp = 0; }
     else { if(!P1||!P2) return; P1.hp = 0; }
-  } else if (type === 'cs_hover') {
-    // Opponent moved their cursor — update our local view
-    if (data.player === 'p1') p1ci = data.ci;
-    else p2ci = data.ci;
-
-  } else if (type === 'cs_pick') {
-    if (data.player === 'p1') { p1ci = data.ci; csc.p1 = true; cfmSnd(); }
-    else                       { p2ci = data.ci; csc.p2 = true; cfmSnd(); }
-    if(csc.p1&&csc.p2) setTimeout(()=>{ SCREEN='ss'; },350);
-
-  } else if (type === 'cs_advance') {
-    // Host told everyone to advance to stage select
-    SCREEN = 'ss';
-
-  } else if (type === 'ss_hover') {
-    if (data.player === 'p1') p1sv = data.sv;
-    else p2sv = data.sv;
-
-  } else if (type === 'ss_pick') {
-    if (data.player === 'p1') { p1sv = data.sv; ssc.p1 = true; cfmSnd(); }
-    else                       { p2sv = data.sv; ssc.p2 = true; cfmSnd(); }
-    if(ssc.p1&&ssc.p2){
-      if(p1sv===99&&p2sv===99) stg=Math.floor(Math.random()*STAGES.length);
-      else if(p1sv===99) stg=p2sv;
-      else if(p2sv===99) stg=p1sv;
-      else stg=p1sv===p2sv?p1sv:Math.random()<.5?p1sv:p2sv;
-      setTimeout(()=>beginCountdown(),350);
-    }
   }
 }
 
@@ -6062,6 +6044,15 @@ function drawOnlineScreen() {
     if (net.oppName) {
       ctx.fillStyle = '#ff4'; ctx.font = '8px "Press Start 2P"';
       ctx.fillText(`Opponent: ${net.oppName}`, W/2, 200);
+      // Kick button (P1/host only)
+      if (net.isP1) {
+        ctx.strokeStyle = '#f44'; ctx.lineWidth = 1;
+        ctx.strokeRect(W/2-60, 215, 120, 22);
+        ctx.fillStyle = '#f44'; ctx.font = '5px "Press Start 2P"';
+        ctx.fillText('[ KICK PLAYER ]', W/2, 230);
+        // Store kick button bounds for click detection
+        net._kickBtnBounds = {x:W/2-60, y:215, w:120, h:22};
+      }
     } else {
       // Pulse waiting text
       const p = .5+.5*Math.sin(Date.now()*.003);
@@ -6121,6 +6112,19 @@ C.addEventListener('click', e => {
   const mx = (e.clientX-r.left)*(W/r.width);
   const my = (e.clientY-r.top)*(H/r.height);
 
+  // Kick button
+  if (net._kickBtnBounds && net.isP1 && net.oppName) {
+    const kb = net._kickBtnBounds;
+    const bx = kb.x*(W/r.width) + r.left - (r.left*(W/r.width) - r.left);
+    // Convert canvas coords back
+    if (mx >= kb.x && mx <= kb.x+kb.w && my >= kb.y && my <= kb.y+kb.h) {
+      netSend('kick', {}, net.oppName);
+      net.oppName = ''; net.onlinePlayers = {};
+      netSetStatus('✅ Player kicked.');
+      return;
+    }
+  }
+
   // Click name field
   if (mx >= W/2-180 && mx <= W/2+180 && my >= 105 && my <= 141)
     { _onlineScreen.inputFocus = 'name'; return; }
@@ -6160,12 +6164,57 @@ const _origKeydown = null; // handled inline below in existing keydown handler
 
 // ── CS/SS ONLINE SYNC PATCHES ─────────────────────────
 // Patched into existing keydown handler by wrapping the confirm keys
-function netSyncCsPick(ci) { if(net.enabled) netSend('cs_pick', {ci}); }
-function netSyncSsPick(sv) { if(net.enabled) netSend('ss_pick', {sv}); }
+// ── SHARED SELECT STATE via Ably Presence ────────────
+// Instead of individual messages, we broadcast our full state
+// in presence.update() — fast, reliable, and both sides always in sync
 
-// In online mode: P1 host drives P1 char, P2 drives P2 char
-// Their picks are received via onNetMessage (cs_pick / ss_pick)
-// We patch the CS confirm so P1's 'f' key only locks P1, P2's ',' locks P2
+function netBroadcastSelectState() {
+  if (!net.channel || !net.connected) return;
+  net.channel.presence.update({
+    name: net.myName,
+    isP1: net.isP1,
+    screen: SCREEN,
+    p1ci, p2ci, p1sv, p2sv,
+    csc_p1: csc.p1, csc_p2: csc.p2,
+    ssc_p1: ssc.p1, ssc_p2: ssc.p2,
+  });
+}
+
+// Called whenever we receive a presence update from opponent
+function applyRemoteSelectState(data) {
+  if (!data) return;
+  // Merge their state into ours
+  if (data.isP1) {
+    // They are P1 — take their p1 values
+    p1ci = data.p1ci ?? p1ci;
+    p1sv = data.p1sv ?? p1sv;
+    csc.p1 = data.csc_p1 ?? csc.p1;
+    ssc.p1 = data.ssc_p1 ?? ssc.p1;
+  } else {
+    // They are P2 — take their p2 values
+    p2ci = data.p2ci ?? p2ci;
+    p2sv = data.p2sv ?? p2sv;
+    csc.p2 = data.csc_p2 ?? csc.p2;
+    ssc.p2 = data.ssc_p2 ?? ssc.p2;
+  }
+  // Sync screen transitions
+  if (data.screen === 'cs' && SCREEN === 'online') {
+    netStartMatch();
+  }
+  if (data.screen === 'ss' && SCREEN === 'cs' && csc.p1 && csc.p2) {
+    setTimeout(()=>{ SCREEN='ss'; }, 50);
+  }
+  if (data.csc_p1 && data.csc_p2 && SCREEN === 'cs') {
+    setTimeout(()=>{ SCREEN='ss'; }, 350);
+  }
+  if (data.ssc_p1 && data.ssc_p2 && SCREEN === 'ss') {
+    if(p1sv===99&&p2sv===99) stg=Math.floor(Math.random()*STAGES.length);
+    else if(p1sv===99) stg=p2sv;
+    else if(p2sv===99) stg=p1sv;
+    else stg=p1sv===p2sv?p1sv:Math.random()<.5?p1sv:p2sv;
+    setTimeout(()=>beginCountdown(),350);
+  }
+}
 
 // ── OVERRIDE upP IN MAIN LOOP TO USE NET KEYS ─────────
 // The main loop calls: upP(P1,P2,B1); upP(P2,P1,B2);
